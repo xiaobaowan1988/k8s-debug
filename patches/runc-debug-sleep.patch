@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [debug] inject 30s sleep to allow dlv attach to short-lived runc process
+
+This patch adds a 30-second sleep at the entry point of runc's init
+process setup, giving enough time to attach a debugger via `dlv attach`.
+
+The sleep is conditioned on the RUNC_DEBUG_SLEEP environment variable
+so it can be toggled without recompiling.
+
+DO NOT USE IN PRODUCTION.
+
+diff --git a/libcontainer/process_linux.go b/libcontainer/process_linux.go
+--- a/libcontainer/process_linux.go
++++ b/libcontainer/process_linux.go
+@@ -1,6 +1,7 @@
+ package libcontainer
+
+ import (
++	"os"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -8,6 +9,7 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strconv"
++	"time"
+ 	"strings"
+ 	"sync"
+
+@@ -50,6 +52,14 @@ type initProcess struct {
+ }
+
+ func (p *initProcess) pid() int {
++	// debug: allow dlv attach during startup
++	if os.Getenv("RUNC_DEBUG_SLEEP") != "" {
++		secs := 30
++		if v := os.Getenv("RUNC_DEBUG_SLEEP"); v != "" {
++			if n, err := strconv.Atoi(v); err == nil && n > 0 {
++				secs = n
++			}
++		}
++		time.Sleep(time.Duration(secs) * time.Second)
++	}
+ 	return p.cmd.Process.Pid
+ }
+diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -1,6 +1,8 @@
+ package main
+
+ import (
++	"os"
++	"time"
+ 	"fmt"
+ 	"os"
+
+@@ -15,6 +17,15 @@ func main() {
+ 	app := cli.NewApp()
+ 	app.Name = "runc"
+ 	app.Usage = usage
++
++	// debug hook: sleep at startup to allow `dlv attach`
++	// Activate with: RUNC_DEBUG_SLEEP=30 runc ...
++	if sleepSec := os.Getenv("RUNC_DEBUG_SLEEP"); sleepSec != "" {
++		if n, err := strconv.Atoi(sleepSec); err == nil && n > 0 {
++			fmt.Fprintf(os.Stderr, "[runc-debug] sleeping %ds for dlv attach (PID=%d)\n", n, os.Getpid())
++			time.Sleep(time.Duration(n) * time.Second)
++		}
++	}
++
+ 	app.Version = version.Version
