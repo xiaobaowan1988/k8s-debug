@@ -28,13 +28,15 @@ all: help
 
 ## ── 一键安装 ──────────────────────────────────────────────────────────────────
 setup:
-	@echo "==> [1/4] 安装系统依赖（kubeadm、kubelet、containerd、dlv）"
+	@echo "==> [1/5] 安装系统依赖（kubeadm、kubelet、containerd、dlv）"
 	@bash scripts/00-install-deps.sh
-	@echo "==> [2/4] 克隆所有源码"
+	@echo "==> [2/5] 克隆所有源码"
 	@$(MAKE) clone
-	@echo "==> [3/4] 编译所有组件（带调试符号）"
+	@echo "==> [3/5] 编译所有组件（带调试符号）"
 	@$(MAKE) build-all
-	@echo "==> [4/4] 初始化集群并注入调试二进制"
+	@echo "==> [4/5] 构建离线镜像（网络受限时从 dl.k8s.io + GitHub 下载）"
+	@$(MAKE) build-offline-images
+	@echo "==> [5/5] 初始化集群并注入调试二进制"
 	@$(MAKE) cluster-create inject-binaries
 	@echo ""
 	@echo "✓ 环境就绪。运行 'make debug-all' 开启全链路调试。"
@@ -72,6 +74,10 @@ build-runc-patched:
 
 build-cni:
 	@bash scripts/02-build-cni.sh $(CNI_SRC) $(RUNTIME_BUILD)
+
+## ── 离线镜像构建 ──────────────────────────────────────────────────────────────
+build-offline-images:
+	@bash scripts/03-build-offline-images.sh
 
 ## ── 集群管理（直接在 VM 上用 kubeadm）────────────────────────────────────────
 cluster-create:

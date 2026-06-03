@@ -53,21 +53,17 @@ else
     ok "Delve 已存在: $(dlv version | head -1)"
 fi
 
-# ── kubeadm / kubelet / kubectl（来自 k8s apt 仓库）──────────────────────────
+# ── kubeadm / kubelet / kubectl（直接从 dl.k8s.io 下载二进制）────────────────
 if ! command -v kubeadm &>/dev/null; then
     info "安装 kubeadm / kubelet / kubectl v${K8S_VERSION}"
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION%.*}/deb/Release.key" \
-        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION%.*}/deb/ /" \
-        > /etc/apt/sources.list.d/kubernetes.list
-    apt-get update -qq
-    apt-get install -y -qq \
-        "kubelet=${K8S_VERSION}-*" \
-        "kubeadm=${K8S_VERSION}-*" \
-        "kubectl=${K8S_VERSION}-*"
-    apt-mark hold kubelet kubeadm kubectl
+    for bin in kubeadm kubelet kubectl; do
+        info "  下载 $bin"
+        curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/${GOARCH}/${bin}" \
+            -o "/usr/local/bin/${bin}"
+        chmod +x "/usr/local/bin/${bin}"
+    done
+    # kubelet 还需要在 /usr/bin（kubeadm 默认搜索路径）
+    cp /usr/local/bin/kubelet /usr/bin/kubelet
     ok "kubeadm/kubelet/kubectl ${K8S_VERSION} 安装完成"
 else
     ok "kubeadm 已存在: $(kubeadm version --output short 2>/dev/null || kubeadm version)"
