@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 创建 Kind 调试集群并完成所有必要的配置
+# 使用 kubeadm 直接在本机初始化单节点 Kubernetes 集群
+# cgroup driver: cgroupfs（systemd 不是 PID 1，不能用 systemd driver）
 set -euo pipefail
 
-CLUSTER_NAME="${1:-k8s-debug}"
-KIND_NODE_IMG="${2:-kindest/node:local-debug}"
-KIND_CONFIG="${3:-$(dirname "$0")/../config/kind-cluster.yaml}"
+KUBEADM_CONFIG="${1:-$(dirname "$0")/../config/kubeadm-config.yaml}"
+CONTAINERD_K8S_CONFIG="${2:-$(dirname "$0")/../config/containerd-k8s.toml}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -13,98 +13,117 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m  $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 die()   { echo -e "\033[1;31m[ERR ]\033[0m  $*"; exit 1; }
 
-command -v kind   || die "Kind 未安装"
-command -v docker || die "Docker 未运行"
+command -v kubeadm  || die "kubeadm 未安装，请先运行 scripts/00-install-deps.sh"
+command -v kubelet  || die "kubelet 未安装，请先运行 scripts/00-install-deps.sh"
+command -v containerd || die "containerd 未安装，请先运行 scripts/00-install-deps.sh"
 
-docker image inspect "$KIND_NODE_IMG" &>/dev/null || die "节点镜像不存在: $KIND_NODE_IMG  请先运行 03-build-kind-image.sh"
-
-if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-    warn "集群 $CLUSTER_NAME 已存在"
-    read -rp "是否重建？[y/N] " yn
-    [[ "$yn" =~ ^[Yy]$ ]] || exit 0
-    kind delete cluster --name "$CLUSTER_NAME"
+# ── 重置已有集群 ───────────────────────────────────────────────────────────────
+if [[ -f /etc/kubernetes/admin.conf ]]; then
+    warn "检测到已有集群配置，重置..."
+    kubeadm reset --force 2>/dev/null || true
+    rm -rf /etc/kubernetes /var/lib/etcd
 fi
 
-mkdir -p /tmp/k8s-debug-bins /tmp/k8s-debug-src
+# ── 配置 containerd（启用 CRI + cgroupfs）──────────────────────────────────
+info "配置 containerd（CRI 模式 + cgroupfs）"
+mkdir -p /etc/containerd
 
-info "创建 Kind 集群: $CLUSTER_NAME"
-kind create cluster \
-    --name "$CLUSTER_NAME" \
-    --config "$KIND_CONFIG" \
-    --retain \
-    --wait 0s 2>&1 || true
+# 生成默认配置再覆盖关键项
+containerd config default > /etc/containerd/config.toml
 
-CONTROL_PLANE=$(kind get nodes --name "$CLUSTER_NAME" | grep control-plane | head -1)
-[[ -n "$CONTROL_PLANE" ]] || die "未找到控制平面节点"
+# 使用 cgroupfs：SystemdCgroup 设为 false
+sed -i 's/SystemdCgroup = true/SystemdCgroup = false/g' /etc/containerd/config.toml
 
-info "等待控制平面就绪..."
-until kubectl get pods -n kube-system --context "kind-${CLUSTER_NAME}" 2>/dev/null | \
-      grep -q "etcd.*Running"; do sleep 2; done
-ok "etcd 已启动"
-
-# ── 配置 CNI ─────────────────────────────────────────────────────────────────
-info "配置 CNI 插件..."
-
-# 检查节点内是否有 bridge 插件，若没有则安装构建好的版本
-if ! docker exec "$CONTROL_PLANE" ls /opt/cni/bin/bridge &>/dev/null; then
-    if [[ -f "${REPO_ROOT}/build/cni-plugins/bridge" ]]; then
-        docker cp "${REPO_ROOT}/build/cni-plugins/bridge" "${CONTROL_PLANE}:/root/bridge"
-        docker exec "$CONTROL_PLANE" mv /root/bridge /opt/cni/bin/bridge
-        docker exec "$CONTROL_PLANE" chmod +x /opt/cni/bin/bridge
-        ok "bridge CNI 插件已安装"
-    else
-        warn "bridge CNI 插件未找到，请先运行 02-build-cni.sh"
-    fi
+# 若 snapshotter 用 overlayfs 在当前内核不可用则降级为 native
+if ! grep -q "overlayfs" /proc/filesystems 2>/dev/null; then
+    warn "overlayfs 不可用，切换为 native snapshotter"
+    sed -i 's/snapshotter = "overlayfs"/snapshotter = "native"/' /etc/containerd/config.toml
 fi
 
-# 应用 bridge CNI 配置
-docker exec "$CONTROL_PLANE" mkdir -p /etc/cni/net.d
-CNI_CONFIG="${REPO_ROOT}/config/cni-bridge-config.json"
-docker cp "$CNI_CONFIG" "${CONTROL_PLANE}:/root/cni.json"
-docker exec "$CONTROL_PLANE" mv /root/cni.json /etc/cni/net.d/10-k8s-debug.conflist
+ok "containerd 配置完成（cgroupfs）"
 
-# 重启 containerd 以加载 CNI 配置
-info "重启 containerd 加载 CNI..."
-docker exec "$CONTROL_PLANE" systemctl restart containerd
-until kubectl get node "$CONTROL_PLANE" --context "kind-${CLUSTER_NAME}" 2>/dev/null | \
-      grep -q "Ready"; do sleep 2; done
-ok "节点已 Ready（CNI 已加载）"
+# ── 启动 containerd ─────────────────────────────────────────────────────────
+info "启动 containerd..."
+# 先杀掉可能存在的旧实例
+pkill -x containerd 2>/dev/null || true
+sleep 1
+nohup containerd > /var/log/containerd.log 2>&1 &
+CONTAINERD_PID=$!
 
-# ── 导入 kube-proxy 镜像 ──────────────────────────────────────────────────────
-info "检查 kube-proxy 镜像..."
-if ! docker exec "$CONTROL_PLANE" ctr -n k8s.io images ls 2>/dev/null | \
-     grep -q "kube-proxy"; then
-    if docker image inspect registry.k8s.io/kube-proxy:v1.32.0 &>/dev/null; then
-        info "导入 kube-proxy 镜像到节点..."
-        docker save registry.k8s.io/kube-proxy:v1.32.0 > /tmp/kube-proxy.tar
-        docker cp /tmp/kube-proxy.tar "${CONTROL_PLANE}:/root/kube-proxy.tar"
-        docker exec "$CONTROL_PLANE" ctr -n k8s.io images import /root/kube-proxy.tar
-        docker exec "$CONTROL_PLANE" rm /root/kube-proxy.tar
-        rm -f /tmp/kube-proxy.tar
-        ok "kube-proxy 镜像已导入"
-    else
-        warn "kube-proxy 镜像不在本地，请先运行 02-build-k8s.sh 并构建 kube-proxy 镜像"
-    fi
+# 等待 socket 就绪
+for i in $(seq 1 30); do
+    [[ -S /run/containerd/containerd.sock ]] && break
+    sleep 1
+done
+[[ -S /run/containerd/containerd.sock ]] || die "containerd 启动失败，查看日志: /var/log/containerd.log"
+ok "containerd 已启动（PID ${CONTAINERD_PID}）"
+
+# ── 关闭 swap（kubeadm 要求）────────────────────────────────────────────────
+swapoff -a 2>/dev/null || true
+
+# ── 加载必要内核模块 ──────────────────────────────────────────────────────────
+info "加载网络内核模块..."
+modprobe br_netfilter 2>/dev/null || warn "br_netfilter 模块加载失败（可能已内置）"
+modprobe overlay 2>/dev/null || warn "overlay 模块加载失败"
+
+# 开启 IP 转发
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+sysctl -w net.bridge.bridge-nf-call-iptables=1 > /dev/null 2>&1 || true
+sysctl -w net.bridge.bridge-nf-call-ip6tables=1 > /dev/null 2>&1 || true
+
+# ── kubeadm init ──────────────────────────────────────────────────────────────
+info "运行 kubeadm init..."
+kubeadm init \
+    --config "${KUBEADM_CONFIG}" \
+    --ignore-preflight-errors=all \
+    --skip-phases=addon/kube-proxy \
+    2>&1 | tee /tmp/kubeadm-init.log
+
+[[ ${PIPESTATUS[0]} -eq 0 ]] || die "kubeadm init 失败，查看日志: /tmp/kubeadm-init.log"
+
+# ── 配置 kubeconfig ───────────────────────────────────────────────────────────
+info "配置 kubeconfig..."
+mkdir -p "$HOME/.kube"
+cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
+chmod 600 "$HOME/.kube/config"
+export KUBECONFIG="$HOME/.kube/config"
+ok "kubeconfig 已配置: $HOME/.kube/config"
+
+# ── 去掉控制平面污点（单节点模式）──────────────────────────────────────────
+info "去除控制平面 taint，允许在单节点上调度 Pod..."
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+
+# ── 安装 CNI（bridge 插件）────────────────────────────────────────────────────
+info "配置 CNI（bridge）..."
+mkdir -p /etc/cni/net.d /opt/cni/bin
+
+# 如果已构建自定义 CNI 插件，优先使用
+CNI_BUILD="${REPO_ROOT}/build/runtime/cni-plugins"
+if [[ -d "$CNI_BUILD" ]] && ls "$CNI_BUILD"/* &>/dev/null; then
+    cp "$CNI_BUILD"/* /opt/cni/bin/
+    chmod +x /opt/cni/bin/*
+    ok "已安装自定义 CNI 插件（带调试符号）"
 fi
 
-# ── 安装 dlv 到节点 ───────────────────────────────────────────────────────────
-info "安装 dlv 到节点..."
-DLV_BIN="${GOPATH:-$HOME/go}/bin/dlv"
-if [[ ! -f "$DLV_BIN" ]]; then
-    info "在宿主机安装 dlv..."
-    GOPATH="${GOPATH:-$HOME/go}" go install github.com/go-delve/delve/cmd/dlv@latest
-fi
-docker cp "$DLV_BIN" "${CONTROL_PLANE}:/root/dlv"
-docker exec "$CONTROL_PLANE" mv /root/dlv /usr/local/bin/dlv
-docker exec "$CONTROL_PLANE" chmod +x /usr/local/bin/dlv
-ok "dlv $(docker exec "$CONTROL_PLANE" dlv version 2>/dev/null | head -1) 已安装"
+# 安装 cni-bridge-config
+cp "${REPO_ROOT}/config/cni-bridge-config.json" /etc/cni/net.d/10-k8s-debug.conflist
+ok "CNI 配置已写入 /etc/cni/net.d/10-k8s-debug.conflist"
 
-ok "集群配置完成"
+# ── 等待节点 Ready ────────────────────────────────────────────────────────────
+info "等待节点 Ready（最多 120s）..."
+for i in $(seq 1 60); do
+    STATUS=$(kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | head -1)
+    [[ "$STATUS" == "Ready" ]] && break
+    sleep 2
+done
+
+kubectl get nodes -o wide
+kubectl get pods -A
+
 echo ""
-kubectl get nodes --context "kind-${CLUSTER_NAME}"
-echo ""
-kubectl get pods -A --context "kind-${CLUSTER_NAME}"
+ok "单节点集群创建完成"
 echo ""
 echo "下一步："
-echo "  运行 scripts/06-setup-debug-manifests.sh 以配置 dlv 调试模式"
-echo "  或直接运行 debug/all.sh 启动调试会话"
+echo "  make inject-binaries   # 注入带调试符号的二进制"
+echo "  make debug-all         # 启动全链路调试会话"

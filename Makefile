@@ -1,9 +1,8 @@
-K8S_VERSION   ?= v1.32.0
+K8S_VERSION        ?= v1.32.0
 CONTAINERD_VERSION ?= v2.0.1
-RUNC_VERSION   ?= v1.2.3
-CNI_VERSION    ?= v1.6.0
-KIND_VERSION   ?= v0.26.0
-DELVE_VERSION  ?= v1.23.1
+RUNC_VERSION       ?= v1.2.3
+CNI_VERSION        ?= v1.6.0
+DELVE_VERSION      ?= v1.23.1
 
 # 源码目录
 SRC_DIR        ?= $(HOME)/k8s-src
@@ -17,30 +16,25 @@ BUILD_DIR      ?= $(CURDIR)/build
 K8S_BUILD      := $(BUILD_DIR)/kubernetes
 RUNTIME_BUILD  := $(BUILD_DIR)/runtime
 
-# Kind 集群配置
-KIND_CLUSTER   ?= k8s-debug
-KIND_IMAGE     ?= registry.k8s.io/kindest/node:$(K8S_VERSION)
-KIND_NODE_IMG  ?= kindest/node:local-debug
-
 GOFLAGS_DEBUG  := -gcflags=all="-N -l"
 
 .PHONY: all setup clone build-k8s build-containerd build-runc build-cni \
-        build-kind-image cluster-create cluster-delete inject-binaries \
-        debug-all clean help
+        cluster-create cluster-delete inject-binaries \
+        debug-all debug-apiserver debug-controller debug-scheduler \
+        debug-kubelet debug-proxy debug-containerd \
+        clean clean-src help
 
 all: help
 
 ## ── 一键安装 ──────────────────────────────────────────────────────────────────
 setup:
-	@echo "==> [1/5] 安装系统依赖"
+	@echo "==> [1/4] 安装系统依赖（kubeadm、kubelet、containerd、dlv）"
 	@bash scripts/00-install-deps.sh
-	@echo "==> [2/5] 克隆所有源码"
+	@echo "==> [2/4] 克隆所有源码"
 	@$(MAKE) clone
-	@echo "==> [3/5] 编译所有组件（带调试符号）"
+	@echo "==> [3/4] 编译所有组件（带调试符号）"
 	@$(MAKE) build-all
-	@echo "==> [4/5] 构建 Kind 节点镜像"
-	@$(MAKE) build-kind-image
-	@echo "==> [5/5] 创建调试集群并注入二进制"
+	@echo "==> [4/4] 初始化集群并注入调试二进制"
 	@$(MAKE) cluster-create inject-binaries
 	@echo ""
 	@echo "✓ 环境就绪。运行 'make debug-all' 开启全链路调试。"
@@ -79,49 +73,46 @@ build-runc-patched:
 build-cni:
 	@bash scripts/02-build-cni.sh $(CNI_SRC) $(RUNTIME_BUILD)
 
-## ── Kind 节点镜像（从 k8s 源码构建）────────────────────────────────────────────
-build-kind-image:
-	@bash scripts/03-build-kind-image.sh $(K8S_SRC) $(KIND_NODE_IMG)
-
-## ── 集群管理 ──────────────────────────────────────────────────────────────────
+## ── 集群管理（直接在 VM 上用 kubeadm）────────────────────────────────────────
 cluster-create:
-	@bash scripts/04-cluster-create.sh $(KIND_CLUSTER) $(KIND_NODE_IMG) config/kind-cluster.yaml
+	@bash scripts/04-cluster-create.sh config/kubeadm-config.yaml
 
 cluster-delete:
-	@kind delete cluster --name $(KIND_CLUSTER) 2>/dev/null || true
+	@kubeadm reset --force 2>/dev/null || true
+	@rm -rf /etc/kubernetes /var/lib/etcd $$HOME/.kube/config
 
 cluster-status:
-	@kubectl cluster-info --context kind-$(KIND_CLUSTER) 2>/dev/null
-	@kubectl get nodes -o wide 2>/dev/null
+	@kubectl cluster-info 2>/dev/null || true
+	@kubectl get nodes -o wide 2>/dev/null || true
 
 ## ── 注入调试二进制 ────────────────────────────────────────────────────────────
 inject-binaries:
-	@bash scripts/05-inject-binaries.sh $(KIND_CLUSTER) $(K8S_BUILD) $(RUNTIME_BUILD)
+	@bash scripts/05-inject-binaries.sh $(K8S_BUILD) $(RUNTIME_BUILD)
 
 inject-runc-patched:
-	@bash scripts/05-inject-runc-patched.sh $(KIND_CLUSTER) $(RUNTIME_BUILD)
+	@bash scripts/05-inject-runc-patched.sh $(RUNTIME_BUILD)
 
 ## ── 调试入口 ──────────────────────────────────────────────────────────────────
 debug-all:
-	@bash debug/all.sh $(KIND_CLUSTER)
+	@bash debug/all.sh
 
 debug-apiserver:
-	@bash debug/apiserver.sh $(KIND_CLUSTER)
+	@bash debug/apiserver.sh
 
 debug-controller:
-	@bash debug/controller-manager.sh $(KIND_CLUSTER)
+	@bash debug/controller-manager.sh
 
 debug-scheduler:
-	@bash debug/scheduler.sh $(KIND_CLUSTER)
+	@bash debug/scheduler.sh
 
 debug-kubelet:
-	@bash debug/kubelet.sh $(KIND_CLUSTER)
+	@bash debug/kubelet.sh
 
 debug-proxy:
-	@bash debug/kube-proxy.sh $(KIND_CLUSTER)
+	@bash debug/kube-proxy.sh
 
 debug-containerd:
-	@bash debug/containerd.sh $(KIND_CLUSTER)
+	@bash debug/containerd.sh
 
 ## ── 清理 ──────────────────────────────────────────────────────────────────────
 clean:
@@ -134,7 +125,7 @@ clean-src:
 
 ## ── 帮助 ──────────────────────────────────────────────────────────────────────
 help:
-	@echo "Kubernetes 全链路源码调试环境"
+	@echo "Kubernetes 全链路源码调试环境（直接运行在 VM，无 Docker-in-Docker）"
 	@echo ""
 	@echo "快速开始:"
 	@echo "  make setup              # 一键完整安装（依赖+编译+集群）"
@@ -142,16 +133,23 @@ help:
 	@echo "分步操作:"
 	@echo "  make clone              # 克隆所有源码"
 	@echo "  make build-all          # 编译所有组件（带调试符号）"
-	@echo "  make build-kind-image   # 从 k8s 源码构建 Kind 节点镜像"
-	@echo "  make cluster-create     # 创建调试集群"
-	@echo "  make inject-binaries    # 注入调试版二进制到集群节点"
+	@echo "  make cluster-create     # kubeadm init 创建单节点集群"
+	@echo "  make inject-binaries    # 注入调试版二进制到 /usr/local/bin"
 	@echo ""
 	@echo "调试:"
 	@echo "  make debug-all          # 开启所有组件的 dlv 调试会话（tmux）"
-	@echo "  make debug-apiserver    # 仅调试 kube-apiserver"
-	@echo "  make debug-scheduler    # 仅调试 kube-scheduler"
-	@echo "  make debug-kubelet      # 仅调试 kubelet"
-	@echo "  make debug-containerd   # 仅调试 containerd"
+	@echo "  make debug-apiserver    # 仅调试 kube-apiserver (port 2345)"
+	@echo "  make debug-controller   # 仅调试 kube-controller-manager (port 2346)"
+	@echo "  make debug-scheduler    # 仅调试 kube-scheduler (port 2347)"
+	@echo "  make debug-kubelet      # 仅调试 kubelet (port 2348)"
+	@echo "  make debug-proxy        # 仅调试 kube-proxy (port 2349)"
+	@echo "  make debug-containerd   # 仅调试 containerd (port 2350)"
+	@echo ""
+	@echo "集群管理:"
+	@echo "  make cluster-status     # 查看节点和 Pod 状态"
+	@echo "  make cluster-delete     # kubeadm reset + 清理"
 	@echo ""
 	@echo "配置变量:"
 	@echo "  K8S_VERSION=$(K8S_VERSION)  CONTAINERD_VERSION=$(CONTAINERD_VERSION)  RUNC_VERSION=$(RUNC_VERSION)"
+	@echo ""
+	@echo "注意: cgroup driver 使用 cgroupfs（本环境 systemd 不是 PID 1）"

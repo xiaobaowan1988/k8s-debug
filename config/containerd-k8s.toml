@@ -1,0 +1,12 @@
+version = 3
+
+[plugins]
+  [plugins.'io.containerd.grpc.v1.cri']
+    [plugins.'io.containerd.grpc.v1.cri'.containerd]
+      snapshotter = "overlayfs"
+      [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes]
+        [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runc.options]
+            # cgroupfs: systemd 不是 PID 1，不能使用 systemd cgroup driver
+            SystemdCgroup = false

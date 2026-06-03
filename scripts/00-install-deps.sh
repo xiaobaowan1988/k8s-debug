@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 安装所有系统依赖：Docker、Kind、Delve、调试工具
+# 安装所有系统依赖：kubeadm、kubelet、kubectl、containerd、Delve、调试工具
 set -euo pipefail
 
 DELVE_VERSION="${DELVE_VERSION:-v1.23.1}"
-KIND_VERSION="${KIND_VERSION:-v0.26.0}"
+K8S_VERSION="${K8S_VERSION:-1.32.0}"
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  GOARCH=amd64 ;;
@@ -23,8 +23,8 @@ apt-get install -y -qq \
     libdevmapper-dev libsystemd-dev libc6-dev libgpgme-dev \
     git curl wget tar jq tmux socat conntrack iptables iproute2 \
     gdb gdb-multiarch \
-    rsync unzip ca-certificates gnupg lsb-release \
-    btrfs-progs
+    rsync unzip ca-certificates gnupg lsb-release apt-transport-https \
+    btrfs-progs ethtool
 ok "系统包安装完成"
 
 # ── Go 工具链 ─────────────────────────────────────────────────────────────────
@@ -53,37 +53,48 @@ else
     ok "Delve 已存在: $(dlv version | head -1)"
 fi
 
-# ── Docker ───────────────────────────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
-    info "安装 Docker Engine"
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable --now docker 2>/dev/null || true
-    ok "Docker 安装完成"
+# ── kubeadm / kubelet / kubectl（来自 k8s apt 仓库）──────────────────────────
+if ! command -v kubeadm &>/dev/null; then
+    info "安装 kubeadm / kubelet / kubectl v${K8S_VERSION}"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION%.*}/deb/Release.key" \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION%.*}/deb/ /" \
+        > /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -qq
+    apt-get install -y -qq \
+        "kubelet=${K8S_VERSION}-*" \
+        "kubeadm=${K8S_VERSION}-*" \
+        "kubectl=${K8S_VERSION}-*"
+    apt-mark hold kubelet kubeadm kubectl
+    ok "kubeadm/kubelet/kubectl ${K8S_VERSION} 安装完成"
 else
-    ok "Docker 已存在: $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+    ok "kubeadm 已存在: $(kubeadm version --output short 2>/dev/null || kubeadm version)"
 fi
 
-# ── Kind ─────────────────────────────────────────────────────────────────────
-if ! command -v kind &>/dev/null; then
-    info "安装 Kind $KIND_VERSION"
-    curl -fsSL "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-${GOARCH}" \
-        -o /usr/local/bin/kind
-    chmod +x /usr/local/bin/kind
-    ok "Kind 安装完成: $(kind version)"
+# ── containerd（若未安装则安装；已有则保留）──────────────────────────────────
+if ! command -v containerd &>/dev/null; then
+    info "安装 containerd"
+    CONTAINERD_VERSION="2.0.1"
+    curl -fsSL "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${GOARCH}.tar.gz" \
+        -o /tmp/containerd.tar.gz
+    tar -C /usr/local -xzf /tmp/containerd.tar.gz
+    ok "containerd ${CONTAINERD_VERSION} 安装完成"
 else
-    ok "Kind 已存在: $(kind version)"
+    ok "containerd 已存在: $(containerd --version)"
 fi
 
-# ── kubectl ───────────────────────────────────────────────────────────────────
-if ! command -v kubectl &>/dev/null; then
-    info "安装 kubectl"
-    K8S_VER="v1.32.0"
-    curl -fsSL "https://dl.k8s.io/release/${K8S_VER}/bin/linux/${GOARCH}/kubectl" \
-        -o /usr/local/bin/kubectl
-    chmod +x /usr/local/bin/kubectl
-    ok "kubectl 安装完成"
+# ── runc（若未安装则安装）────────────────────────────────────────────────────
+if ! command -v runc &>/dev/null; then
+    info "安装 runc"
+    RUNC_VERSION="1.2.3"
+    curl -fsSL "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${GOARCH}" \
+        -o /usr/local/sbin/runc
+    chmod +x /usr/local/sbin/runc
+    ok "runc ${RUNC_VERSION} 安装完成"
 else
-    ok "kubectl 已存在"
+    ok "runc 已存在: $(runc --version | head -1)"
 fi
 
 # ── grpcurl（用于 CSI 调试）──────────────────────────────────────────────────
@@ -96,7 +107,8 @@ fi
 echo ""
 ok "所有依赖安装完成"
 go version
-docker version --format 'Docker: {{.Server.Version}}' 2>/dev/null || true
-kind version
+containerd --version
+runc --version | head -1
+kubeadm version --output short 2>/dev/null || true
 kubectl version --client --short 2>/dev/null || true
 dlv version | head -1
