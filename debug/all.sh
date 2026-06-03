@@ -33,7 +33,7 @@ tmux send-keys -t "${SESSION}:apiserver" "
 bash ${SCRIPT_DIR}/apiserver.sh ${CLUSTER_NAME} 2345
 echo '---'
 echo '连接命令: dlv connect localhost:2345'
-echo '核心断点: b k8s.io/apiserver/pkg/registry/generic/registry/store.go:370'
+echo '核心断点: b k8s.io/apiserver/pkg/registry/generic/registry/store.go:446'
 " Enter
 
 # 窗口2: kube-controller-manager 调试
@@ -51,7 +51,7 @@ tmux send-keys -t "${SESSION}:scheduler" "
 bash ${SCRIPT_DIR}/scheduler.sh ${CLUSTER_NAME} 2347
 echo '---'
 echo '连接命令: dlv connect localhost:2347'
-echo '核心断点: b k8s.io/kubernetes/pkg/scheduler.(*Scheduler).scheduleOne'
+echo '核心断点: b k8s.io/kubernetes/pkg/scheduler.(*Scheduler).ScheduleOne'
 " Enter
 
 # 窗口4: kubelet 调试

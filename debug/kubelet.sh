@@ -52,6 +52,7 @@ docker exec -d "$NODE" bash -c "
         --listen=0.0.0.0:${DLV_PORT} \
         --api-version=2 \
         --accept-multiclient \
+        --check-go-version=false \
         2>/tmp/dlv-kubelet.log &
     echo \$! > /tmp/dlv-kubelet.pid
 "
