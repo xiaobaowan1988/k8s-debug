@@ -1,26 +1,22 @@
 {
-  "cniVersion": "1.0.0",
-  "name": "debug-bridge-net",
-  "type": "bridge",
-  "bridge": "cni-debug0",
-  "isGateway": true,
-  "ipMasq": true,
-  "hairpinMode": true,
-  "ipam": {
-    "type": "host-local",
-    "ranges": [
-      [
-        {
-          "subnet": "10.88.0.0/16",
-          "rangeStart": "10.88.0.10",
-          "rangeEnd": "10.88.0.250",
-          "gateway": "10.88.0.1"
-        }
-      ]
-    ],
-    "routes": [
-      {"dst": "0.0.0.0/0"}
-    ],
-    "dataDir": "/tmp/cni-debug-ipam"
-  }
+  "cniVersion": "0.4.0",
+  "name": "k8s-debug-net",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": "10.244.0.0/24"}]],
+        "routes": [{"dst": "0.0.0.0/0"}]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
 }

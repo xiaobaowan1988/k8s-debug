@@ -1,0 +1,4 @@
+build/
+*.tar
+*.tar.gz
+/tmp/

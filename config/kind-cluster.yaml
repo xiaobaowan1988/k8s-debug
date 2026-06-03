@@ -44,10 +44,6 @@ nodes:
         apiServer:
           extraArgs:
             allow-privileged: "true"
-
-  - role: worker
-    image: kindest/node:local-debug
-    extraMounts:
-      - hostPath: /tmp/k8s-debug-bins
-        containerPath: /debug-bins
-        readOnly: false
+      - |
+        kind: KubeletConfiguration
+        cgroupDriver: cgroupfs
