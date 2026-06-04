@@ -36,10 +36,12 @@ dlv attach "${CTD_PID}" \
     --listen="0.0.0.0:${DLV_PORT}" \
     --api-version=2 \
     --accept-multiclient \
+    --check-go-version=false \
     > /tmp/dlv-containerd.log 2>&1 &
+disown
 
 sleep 2
-if pgrep -f "dlv attach" &>/dev/null; then
+if ss -tlnp 2>/dev/null | grep -q ":${DLV_PORT}"; then
     ok "dlv 已启动（localhost:${DLV_PORT}）"
 else
     echo "dlv 启动失败:"
