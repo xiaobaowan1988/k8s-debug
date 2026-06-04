@@ -57,9 +57,9 @@
 ### 阶段 5：配置与认证
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `15-config-secret.md` | ConfigMap + Secret | ⬜ |
-| `16-serviceaccount.md` | ServiceAccount + TokenRequest | ⬜ |
-| `17-rbac.md` | Role / RoleBinding / ClusterRole / ClusterRoleBinding | ⬜ |
+| `15-config-secret.md` | ConfigMap + Secret | ✅ |
+| `16-serviceaccount.md` | ServiceAccount + TokenRequest | ✅ |
+| `17-rbac.md` | Role / RoleBinding / ClusterRole / ClusterRoleBinding | ✅ |
 
 ### 阶段 6：命名空间与配额
 | 文档 | 资源 | 状态 |
