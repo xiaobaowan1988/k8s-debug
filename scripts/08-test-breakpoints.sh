@@ -904,14 +904,18 @@ INIT_SCRIPT
 #   containerd/CRI(2350) → CSI hostpath(2353) → runc/CNI(符号验证) →
 #   kernel(copy_process strace)
 test_stateful_pod_flow() {
-    info "═══ 有状态 Pod 创建全链路断点测试 ═══"
-    # 有状态 Pod（带 PVC，Immediate 绑定模式）完整流程：
-    #   apiserver → etcd → controller-manager(syncUnboundClaim)
-    #   → CSI(CreateVolume) → controller-manager(bindVolumeToClaim)
-    #   → scheduler → kubelet
+    info "═══ 有状态 Pod 创建全链路断点测试（StatefulSet）═══"
+    # StatefulSet + volumeClaimTemplates + CSI hostpath 完整流程：
+    #   apiserver(StatefulSet) → etcd
+    #   → controller-manager(syncStatefulSet) → 创建 Pod-0 + PVC-0
+    #   → apiserver(Pod,PVC) → etcd
+    #   → controller-manager(syncUnboundClaim) → 触发 CSI 动态配置
+    #   → CSI(CreateVolume)
+    #   → controller-manager(bindVolumeToClaim) → PVC Bound
+    #   → scheduler(ScheduleOne) → kubelet(HandlePodAdditions)
     #   → CRI(RunPodSandbox→CreateContainer→StartContainer)
     #   → runc(Container.Start) → CNI(cmdAdd) → kernel
-    info "  链路: apiserver→etcd→controller-manager→CSI→scheduler→kubelet→CRI→runc→CNI→kernel"
+    info "  链路: apiserver→etcd→ctrl(syncStatefulSet)→apiserver→etcd→ctrl(syncUnboundClaim)→CSI→ctrl(bindVolumeToClaim)→scheduler→kubelet→CRI→runc→CNI→kernel"
 
     # 检查集群是否就绪
     if ! kubectl get nodes >/dev/null 2>&1; then
@@ -968,17 +972,22 @@ test_stateful_pod_flow() {
             "go.etcd.io/etcd/server/v3/etcdserver.(*EtcdServer).Put" \
             "etcd" 35
 
-    # kube-controller-manager (2346): PVC 状态机
-    # syncUnboundClaim: 检测到未绑定 PVC，触发 CSI external-provisioner 动态配置
+    # kube-controller-manager (2346): 三个断点按执行顺序排列
+    # 1. syncStatefulSet: StatefulSet controller 检测到新 StatefulSet，创建 Pod-0 + PVC-0
+    ss -tlnp 2>/dev/null | grep -q ":2346" && \
+        set_bp_watch 2346 \
+            "k8s.io/kubernetes/pkg/controller/statefulset.(*StatefulSetController).syncStatefulSet" \
+            "ctrl_sts" 35
+    # 2. syncUnboundClaim: PVC controller 检测到 PVC-0 未绑定，触发 CSI 动态配置
     ss -tlnp 2>/dev/null | grep -q ":2346" && \
         set_bp_watch 2346 \
             "k8s.io/kubernetes/pkg/controller/volume/persistentvolume.(*PersistentVolumeController).syncUnboundClaim" \
-            "ctrl_pvc_unbound" 35
-    # bindVolumeToClaim: CSI 创建 PV 后，controller-manager 把 PV 绑定到 PVC
+            "ctrl_pvc_unbound" 40
+    # 3. bindVolumeToClaim: CSI 创建 PV 后，PVC controller 把 PV 绑定到 PVC-0
     ss -tlnp 2>/dev/null | grep -q ":2346" && \
         set_bp_watch 2346 \
             "k8s.io/kubernetes/pkg/controller/volume/persistentvolume.(*PersistentVolumeController).bindVolumeToClaim" \
-            "ctrl_pvc_bind" 40
+            "ctrl_pvc_bind" 45
 
     # kube-scheduler (2347): Pod 调度（等待 PVC Bound 后才能调度）
     ss -tlnp 2>/dev/null | grep -q ":2347" && \
@@ -1044,8 +1053,10 @@ test_stateful_pod_flow() {
     # 等待断点和 strace 就绪
     sleep 3
 
-    # ── Phase 3: 触发 — 创建 StorageClass + PVC + Pod ─────────────────────
-    info "  [2/4] 创建 StorageClass + PVC + Pod..."
+    # ── Phase 3: 触发 — 创建 StorageClass + StatefulSet ─────────────────────
+    # 使用 StatefulSet + volumeClaimTemplates，让 StatefulSetController 自动创建
+    # Pod-0 和 PVC-0，触发完整的 controller-manager → CSI → scheduler → kubelet 链路
+    info "  [2/4] 创建 StorageClass + StatefulSet（含 volumeClaimTemplates）..."
 
     kubectl apply -f - >/dev/null 2>&1 << SC_EOF || true
 apiVersion: storage.k8s.io/v1
@@ -1057,38 +1068,40 @@ volumeBindingMode: Immediate
 reclaimPolicy: Delete
 SC_EOF
 
-    kubectl apply -n "$NS" -f - >/dev/null 2>&1 << PVC_EOF || true
-apiVersion: v1
-kind: PersistentVolumeClaim
+    # StatefulSet: controller-manager 的 StatefulSetController watch 到后
+    # 自动创建 flow-sts-0 Pod 和 flow-pvc-0 PVC（来自 volumeClaimTemplates）
+    kubectl apply -n "$NS" -f - >/dev/null 2>&1 << STS_EOF || true
+apiVersion: apps/v1
+kind: StatefulSet
 metadata:
-  name: flow-pvc
+  name: flow-sts
 spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: flow-test-sc
-  resources:
-    requests:
-      storage: 10Mi
-PVC_EOF
-
-    kubectl apply -n "$NS" -f - >/dev/null 2>&1 << POD_EOF || true
-apiVersion: v1
-kind: Pod
-metadata:
-  name: flow-pod
-  labels:
-    test: stateful-flow
-spec:
-  containers:
-  - name: app
-    image: registry.k8s.io/pause:3.10
-    volumeMounts:
-    - name: data
-      mountPath: /data
-  volumes:
-  - name: data
-    persistentVolumeClaim:
-      claimName: flow-pvc
-POD_EOF
+  selector:
+    matchLabels:
+      app: flow-sts
+  serviceName: flow-sts-svc
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: flow-sts
+    spec:
+      containers:
+      - name: app
+        image: registry.k8s.io/pause:3.10
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: flow-test-sc
+      resources:
+        requests:
+          storage: 10Mi
+STS_EOF
 
     info "  [3/4] 等待 Pod 创建流程（50s）..."
     sleep 50
@@ -1190,8 +1203,10 @@ POD_EOF
     }
 
     # 按流程顺序逐项报告
-    report_component "apiserver"        2345 "apiserver"        "kube-apiserver"     "Store.Create"
+    report_component "apiserver"        2345 "apiserver"        "kube-apiserver"     "Store.Create (StatefulSet)"
     report_component "etcd"             2351 "etcd"             "etcd"               "EtcdServer.Put"
+    report_component "ctrl_sts"         2346 "ctrl_sts"         "controller-manager" "syncStatefulSet → create Pod+PVC"
+    report_component "apiserver"        2345 "apiserver"        "kube-apiserver"     "Store.Create (Pod-0, PVC-0)"
     report_component "ctrl_pvc_unbound" 2346 "ctrl_pvc_unbound" "controller-manager" "syncUnboundClaim"
     report_component "csi"              2353 "csi"              "CSI hostpath"       "CreateVolume"
     report_component "ctrl_pvc_bind"    2346 "ctrl_pvc_bind"    "controller-manager" "bindVolumeToClaim"
@@ -1258,7 +1273,7 @@ POD_EOF
 
     if [[ $flow_pass -gt 0 ]]; then
         ok "  全链路验证: ${flow_pass} 个组件确认，${flow_skip} 个跳过"
-        record "stateful pod flow" "✓ PASS" "${flow_pass}/13 components verified"
+        record "stateful pod flow" "✓ PASS" "${flow_pass}/15 components verified"
     elif [[ $flow_skip -gt 0 ]]; then
         warn "  ${flow_skip} 个组件未监听（运行 debug/all.sh 启动 dlv 服务）"
         record "stateful pod flow" "⚠ SKIP" "dlv ports not listening"
