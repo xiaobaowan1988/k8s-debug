@@ -204,16 +204,15 @@ CNI 插件通过 netlink `RTM_NEWLINK` 在内核创建 veth pair（bridge 插件
 
 **初次 strace 为何未捕获**：第一次 strace 命令仅追踪了 `execve,unshare,mount,clone,openat`，**没有包含 `write`**。runc init 对 `cgroup.procs` 的写入是 `write(fd, "27583\n", 6)` 而非 `openat`，因此被过滤规则排除在外。seccomp 阻断的是容器 init 进程自己调用 `PTRACE_TRACEME` 的路径，不影响 runc init 对 cgroup.procs 的写入。
 
-**直接捕获方法**（`strace -P` 路径过滤）：
+**直接捕获方法**（`strace -y` + grep）：
 
-strace 的 `-P PATH` 选项会将每个系统调用的 fd 参数解析为 `/proc/pid/fd/N` 的真实路径，再按路径名过滤——`write(fd, ...)` 中的 fd 只要指向 `cgroup.procs` 就会被捕获：
+strace 的 `-y` 选项会将每个 fd 参数标注为它在 `/proc/pid/fd/N` 的真实路径，使 `write(fd, ...)` 的输出中包含文件路径信息。由于 cgroup.procs 的完整路径含有动态生成的 Pod UID 和 container ID，无法提前指定；用 `-y` 配合 grep 流式过滤是最直接的方式：
 
 ```bash
-strace -p <containerd-PID> -f \
+strace -p <containerd-PID> -f -y \
     -e trace=openat,write \
-    -P cgroup.procs \
     -e signal=none \
-    -o /tmp/cgroup-direct.log
+    2>&1 | grep cgroup.procs
 ```
 
 预期输出（runc init 写入容器 PID）：
