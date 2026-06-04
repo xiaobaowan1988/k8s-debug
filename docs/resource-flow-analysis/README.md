@@ -64,18 +64,18 @@
 ### 阶段 6：命名空间与配额
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `18-namespace-quota.md` | Namespace + ResourceQuota + LimitRange | ⬜ |
+| `18-namespace-quota.md` | Namespace + ResourceQuota + LimitRange | ✅ |
 
 ### 阶段 7：API 扩展机制
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `19-crd-webhook.md` | CRD + MutatingWebhook + ValidatingWebhook + ValidatingAdmissionPolicy | ⬜ |
-| `20-lease.md` | Lease | ⬜ |
+| `19-crd-webhook.md` | CRD + MutatingWebhook + ValidatingWebhook + ValidatingAdmissionPolicy | ✅ |
+| `20-lease.md` | Lease | ✅ |
 
 ### 阶段 8：安全与访问控制
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `21-auth-resources.md` | CertificateSigningRequest + TokenReview + SubjectAccessReview | ⬜ |
+| `21-auth-resources.md` | CertificateSigningRequest + TokenReview + SubjectAccessReview | ✅ |
 
 ## 版本信息
 
