@@ -22,17 +22,17 @@
 ### 阶段 0：通用基础
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `00-apiserver-common-flow.md` | apiserver 通用处理路径 | ⬜ |
+| `00-apiserver-common-flow.md` | apiserver 通用处理路径 | ✅ |
 
 ### 阶段 1：核心工作负载
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `01-pod.md` | Pod | ⬜ |
-| `02-replicaset.md` | ReplicaSet | ⬜ |
-| `03-deployment.md` | Deployment | ⬜ |
+| `01-pod.md` | Pod | ✅ |
+| `02-replicaset.md` | ReplicaSet | ✅ |
+| `03-deployment.md` | Deployment | ✅ |
 | `04-statefulset.md` | StatefulSet | ✅ 见 `../kernel-syscall-verification.md` |
-| `05-daemonset.md` | DaemonSet | ⬜ |
-| `06-job-cronjob.md` | Job + CronJob | ⬜ |
+| `05-daemonset.md` | DaemonSet | ✅ |
+| `06-job-cronjob.md` | Job + CronJob | ✅ |
 
 ### 阶段 2：存储链路
 | 文档 | 资源 | 状态 |
