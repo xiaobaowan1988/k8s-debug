@@ -51,8 +51,8 @@
 ### 阶段 4：弹性与调度
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `13-hpa.md` | HorizontalPodAutoscaler | ⬜ |
-| `14-scheduling.md` | PriorityClass + PodDisruptionBudget + RuntimeClass | ⬜ |
+| `13-hpa.md` | HorizontalPodAutoscaler | ✅ |
+| `14-scheduling.md` | PriorityClass + PodDisruptionBudget + RuntimeClass | ✅ |
 
 ### 阶段 5：配置与认证
 | 文档 | 资源 | 状态 |
