@@ -832,7 +832,7 @@ INIT_SCRIPT
         local QEMU_PID=$!
         local retry=0
         while ! ss -tlnp 2>/dev/null | grep -q ":$GDB_PORT"; do
-            ((retry++)); [[ $retry -lt 20 ]] || { warn "  QEMU GDB stub 超时"; kill $QEMU_PID 2>/dev/null; record "kernel container BPs" "✗ FAIL" "qemu stub timeout"; return; }
+            retry=$((retry + 1)); [[ $retry -lt 20 ]] || { warn "  QEMU GDB stub 超时"; kill $QEMU_PID 2>/dev/null; record "kernel container BPs" "✗ FAIL" "qemu stub timeout"; return; }
             sleep 0.5
         done
         ok "  QEMU 就绪 (PID $QEMU_PID)"
@@ -857,7 +857,7 @@ INIT_SCRIPT
             echo "  disable $bp_idx"
             echo "  c"
             echo "end"
-            ((bp_idx++))
+            bp_idx=$((bp_idx + 1))
         done
         echo "c"
     } > "$gdb_script"
