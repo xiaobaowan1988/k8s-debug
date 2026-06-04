@@ -202,7 +202,26 @@ CNI 插件通过 netlink `RTM_NEWLINK` 在内核创建 veth pair（bridge 插件
 
 **触发位置**：runc 写入 `cgroup.procs` → 内核调用 `cgroup_attach_task`（`kernel/cgroup/cgroup.c`）
 
-**直接 strace 限制**：runc 子进程（`runc init`）受 seccomp 保护，`ptrace(PTRACE_TRACEME)` 返回 `EPERM`，无法再套一层 strace。
+**初次 strace 为何未捕获**：第一次 strace 命令仅追踪了 `execve,unshare,mount,clone,openat`，**没有包含 `write`**。runc init 对 `cgroup.procs` 的写入是 `write(fd, "27583\n", 6)` 而非 `openat`，因此被过滤规则排除在外。seccomp 阻断的是容器 init 进程自己调用 `PTRACE_TRACEME` 的路径，不影响 runc init 对 cgroup.procs 的写入。
+
+**直接捕获方法**（`strace -P` 路径过滤）：
+
+strace 的 `-P PATH` 选项会将每个系统调用的 fd 参数解析为 `/proc/pid/fd/N` 的真实路径，再按路径名过滤——`write(fd, ...)` 中的 fd 只要指向 `cgroup.procs` 就会被捕获：
+
+```bash
+strace -p <containerd-PID> -f \
+    -e trace=openat,write \
+    -P cgroup.procs \
+    -e signal=none \
+    -o /tmp/cgroup-direct.log
+```
+
+预期输出（runc init 写入容器 PID）：
+```
+13255 openat(AT_FDCWD, "/sys/fs/cgroup/cpu/kubepods/besteffort/pod.../cgroup.procs",
+             O_WRONLY|O_TRUNC) = 7
+13255 write(7</sys/fs/cgroup/cpu/kubepods/besteffort/.../cgroup.procs>, "27583\n", 6) = 6
+```
 
 **功能性验证**（等价证明）：
 
