@@ -735,6 +735,46 @@ except: pass
     printf "    threads: %s\n" "$(cat /proc/$TARGET_PID/status 2>/dev/null | grep ^Threads | awk '{print $2}' || echo n/a)"
 }
 
+# ── systemd：GDB attach PID 1，验证调试符号可用 ──────────────────────────────
+test_systemd() {
+    info "── systemd (GDB) ──"
+
+    if ! command -v gdb >/dev/null 2>&1; then
+        warn "  gdb 未安装（bash debug/systemd.sh 自动安装）"
+        record "systemd (GDB)" "⚠ SKIP" "gdb not installed"
+        return
+    fi
+
+    if ! dpkg -l systemd-dbgsym 2>/dev/null | grep -q "^ii"; then
+        warn "  systemd-dbgsym 未安装（bash debug/systemd.sh 自动安装）"
+        record "systemd (GDB)" "⚠ SKIP" "systemd-dbgsym not installed"
+        return
+    fi
+
+    # 非交互式验证：attach PID 1，确认 unit_start 符号可解析后立即 detach
+    local gdb_out
+    gdb_out=$(timeout 10 gdb -p 1 -batch \
+        -ex "set pagination off" \
+        -ex "b unit_start" \
+        -ex "info breakpoints" \
+        -ex "detach" \
+        -ex "quit" 2>&1 || true)
+
+    if echo "$gdb_out" | grep -q "Breakpoint 1 at"; then
+        local loc
+        loc=$(echo "$gdb_out" | grep "Breakpoint 1 at" | head -1 | sed 's/.*at //')
+        ok "  unit_start → $loc"
+        record "systemd (GDB)" "✓ PASS" "unit_start symbol resolved: $loc"
+    elif echo "$gdb_out" | grep -qiE "no symbol table|no debugging symbols|Cannot find"; then
+        warn "  systemd 调试符号不可用"
+        record "systemd (GDB)" "⚠ WARN" "no debug symbols"
+    else
+        warn "  GDB attach PID 1 失败"
+        echo "$gdb_out" | tail -5 | sed 's/^/    /'
+        record "systemd (GDB)" "⚠ WARN" "GDB attach failed"
+    fi
+}
+
 # ── 运行所有测试 ──────────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
@@ -765,6 +805,8 @@ echo ""
 test_kube_proxy
 echo ""
 test_kernel_strace
+echo ""
+test_systemd
 
 # ── 结果汇总 ──────────────────────────────────────────────────────────────────
 echo ""
