@@ -26,6 +26,7 @@ etcd 的完整调用链。使用 [Delve](https://github.com/go-delve/delve)（Go
 | —    | runc | dlv exec（隔离）| `Container.Start` |
 | —    | CNI bridge | dlv exec（隔离）| `cmdAdd` |
 | —    | Linux 内核 | strace / GDB | 系统调用边界 |
+| —    | systemd | GDB attach PID 1 | `unit_start`, `service_start`, `cgroup_context_apply` |
 
 所有 dlv 服务以 **host-process 模式**运行（控制平面组件接管系统端口，不依赖容器）。
 
