@@ -566,15 +566,15 @@ test_coredns() {
     # Session 1: set breakpoint and continue
     dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
 
-    # 触发：向 debug coredns 实例发 DNS 查询（端口 5353，python3 raw UDP）
+    # 触发：向 host 进程发 DNS 查询（:53，python3 raw UDP）
     python3 -c "
-import socket, time
+import socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(3)
 query = b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
 for part in 'google.com'.split('.'): query += bytes([len(part)]) + part.encode()
 query += b'\x00\x00\x01\x00\x01'
-sock.sendto(query, ('127.0.0.1', 5353))
+sock.sendto(query, ('127.0.0.1', 53))
 try: sock.recvfrom(512)
 except: pass
 sock.close()
