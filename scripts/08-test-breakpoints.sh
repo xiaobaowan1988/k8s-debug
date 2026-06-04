@@ -549,10 +549,196 @@ test_csi() {
     echo "$output" | tail -20
 }
 
+# ── 11. coredns (port 2352) ───────────────────────────────────────────────────
+test_coredns() {
+    info "═══ 测试 CoreDNS (port 2352) ═══"
+    local port=2352
+
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过（先运行 bash debug/coredns.sh）"
+        record "CoreDNS ServeDNS" "⚠ SKIP" "port $port not listening"
+        return
+    fi
+
+    local bp="github.com/coredns/coredns/plugin/forward.(*Forward).ServeDNS"
+    info "  断点: $bp"
+
+    # Session 1: set breakpoint and continue
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    # 触发：向 debug coredns 实例发 DNS 查询（端口 5353，python3 raw UDP）
+    python3 -c "
+import socket, time
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(3)
+query = b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+for part in 'google.com'.split('.'): query += bytes([len(part)]) + part.encode()
+query += b'\x00\x00\x01\x00\x01'
+sock.sendto(query, ('127.0.0.1', 5353))
+try: sock.recvfrom(512)
+except: pass
+sock.close()
+" 2>/dev/null &
+    sleep 4
+
+    # Session 2: query state
+    local output
+    output=$(dlv_session "localhost:$port" 15 \
+        "goroutines" \
+        "stack" \
+        "locals" \
+        "clearall" \
+        "c" \
+    ) || true
+
+    if grep_output "$output" "Forward|ServeDNS|Breakpoint|Goroutine|goroutine"; then
+        ok "  CoreDNS 断点验证通过"
+        record "CoreDNS Forward.ServeDNS" "✓ PASS" "breakpoint hit"
+    else
+        warn "  CoreDNS 输出未包含预期内容"
+        record "CoreDNS Forward.ServeDNS" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -20
+}
+
+# ── 12. kube-proxy (port 2349) ────────────────────────────────────────────────
+test_kube_proxy() {
+    info "═══ 测试 kube-proxy (port 2349) ═══"
+    local port=2349
+
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过（先运行 bash debug/kube-proxy.sh）"
+        record "kube-proxy bp" "⚠ SKIP" "port $port not listening"
+        return
+    fi
+
+    local bp="k8s.io/kubernetes/pkg/proxy/iptables.(*Proxier).syncProxyRules"
+    info "  断点: $bp"
+
+    # Session 1: set breakpoint and continue
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    # 触发：创建/删除 Service 触发 iptables 同步
+    kubectl create service clusterip proxy-bp-test --tcp=80:80 2>/dev/null || true
+    sleep 4
+
+    # Session 2: query state while paused
+    local output
+    output=$(dlv_session "localhost:$port" 15 \
+        "goroutines" \
+        "stack" \
+        "locals" \
+        "clearall" \
+        "c" \
+    ) || true
+
+    kubectl delete service proxy-bp-test --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "syncProxyRules|Proxier|Breakpoint|Goroutine|goroutine"; then
+        ok "  kube-proxy 断点验证通过"
+        record "kube-proxy syncProxyRules" "✓ PASS" "breakpoint hit"
+    else
+        warn "  kube-proxy 输出未包含预期内容"
+        record "kube-proxy syncProxyRules" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -20
+}
+
+# ── 13. 内核路径（strace 系统调用追踪）────────────────────────────────────────
+# CONFIG_KPROBES=n, CONFIG_FTRACE=n → 无法追踪内核函数
+# strace 通过 ptrace 在 syscall 入口/出口捕获，是本环境内核路径观测的主要手段
+test_kernel_strace() {
+    info "═══ 测试内核路径 (strace syscall trace) ═══"
+
+    if ! which strace &>/dev/null; then
+        warn "strace 未安装，跳过"
+        record "kernel strace" "⚠ SKIP" "strace not installed"
+        return
+    fi
+
+    # 目标：集群 coredns pod 进程（/coredns 二进制，非调试实例，不在 dlv 下）
+    # kubelet/containerd/kube-proxy 都在 dlv 下（ptrace 冲突），不能再被 strace
+    local TARGET_PID
+    TARGET_PID=$(pgrep -f "^/coredns" | head -1 || true)
+    if [[ -z "$TARGET_PID" ]]; then
+        warn "集群 coredns 进程未找到，跳过"
+        record "kernel strace" "⚠ SKIP" "no traceable process found"
+        return
+    fi
+
+    # 确认没有被 dlv 占用
+    local tracer
+    tracer=$(awk '/TracerPid/{print $2}' /proc/"$TARGET_PID"/status 2>/dev/null || echo 0)
+    if [[ "$tracer" -ne 0 ]]; then
+        warn "  coredns PID $TARGET_PID 已在 ptrace 下（TracerPid=$tracer），跳过"
+        record "kernel strace" "⚠ SKIP" "process already traced"
+        return
+    fi
+
+    info "  目标: 集群 coredns pod (PID $TARGET_PID)"
+    info "  内核配置:"
+    local kprobes ftrace
+    kprobes=$(grep 'CONFIG_KPROBES=' /boot/config-$(uname -r) 2>/dev/null | head -1 || echo 'n/a')
+    ftrace=$(grep  '^CONFIG_FTRACE='  /boot/config-$(uname -r) 2>/dev/null | head -1 || echo 'n/a')
+    info "    $kprobes  $ftrace"
+    info "  wchan: $(cat /proc/$TARGET_PID/wchan 2>/dev/null || echo n/a)"
+
+    local strace_out
+    strace_out=$(mktemp /tmp/strace-coredns-XXXX.log)
+
+    # 边追踪边触发 DNS 流量（让 coredns 产生 syscall）
+    (
+        for i in 1 2 3; do
+            python3 -c "
+import socket
+sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); sock.settimeout(1)
+q=b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+for p in 'google.com'.split('.'): q+=bytes([len(p)])+p.encode()
+sock.sendto(q+b'\x00\x00\x01\x00\x01',('10.96.0.10',53))
+try: sock.recvfrom(512)
+except: pass
+" 2>/dev/null || true
+            sleep 0.5
+        done
+    ) &
+
+    timeout 3 strace -p "$TARGET_PID" \
+        -e trace=epoll_wait,read,write,sendto,recvfrom,futex,openat \
+        -o "$strace_out" -f -ttt 2>/dev/null || true
+
+    local line_count
+    line_count=$(wc -l < "$strace_out" 2>/dev/null || echo 0)
+
+    if [[ "$line_count" -gt 0 ]]; then
+        ok "  strace 捕获 ${line_count} 条 syscall 记录"
+        echo ""
+        echo "  syscall 频次（TOP 10）："
+        grep -oP '^[0-9]+ +[a-z_]+(?=\()' "$strace_out" 2>/dev/null | awk '{print $2}' | \
+            sort | uniq -c | sort -rn | head -10 | \
+            while read -r cnt name; do printf "    %-20s %d\n" "$name" "$cnt"; done || true
+        echo ""
+        echo "  最近 5 条："
+        tail -5 "$strace_out" | sed 's/^/    /' || true
+        record "kernel strace (coredns)" "✓ PASS" "${line_count} syscalls captured via ptrace"
+    else
+        warn "  strace 未捕获到 syscall"
+        record "kernel strace (coredns)" "⚠ WARN" "0 syscalls captured"
+    fi
+
+    rm -f "$strace_out"
+
+    # 附加：/proc 内核视角
+    echo ""
+    info "  /proc/$TARGET_PID 内核状态："
+    printf "    wchan:   %s\n" "$(cat /proc/$TARGET_PID/wchan 2>/dev/null || echo n/a)"
+    printf "    syscall: %s\n" "$(cat /proc/$TARGET_PID/syscall 2>/dev/null || echo n/a)"
+    printf "    threads: %s\n" "$(cat /proc/$TARGET_PID/status 2>/dev/null | grep ^Threads | awk '{print $2}' || echo n/a)"
+}
+
 # ── 运行所有测试 ──────────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
-info "  K8s 全链路 dlv 断点测试"
+info "  K8s 全链路 dlv 断点测试（含内核路径）"
 info "═══════════════════════════════════════════════"
 echo ""
 
@@ -573,6 +759,12 @@ echo ""
 test_cni
 echo ""
 test_csi
+echo ""
+test_coredns
+echo ""
+test_kube_proxy
+echo ""
+test_kernel_strace
 
 # ── 结果汇总 ──────────────────────────────────────────────────────────────────
 echo ""

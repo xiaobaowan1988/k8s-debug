@@ -85,6 +85,16 @@ if [[ -f "$RUNC_BIN" ]]; then
     ok "  runc → $dest"
 fi
 
+# ── coredns（如果已编译）─────────────────────────────────────────────────────
+COREDNS_BIN="$RUNTIME_BUILD/coredns"
+if [[ -f "$COREDNS_BIN" ]]; then
+    info "注入 coredns（调试版，安装到 /usr/local/bin/coredns-debug）"
+    dest=/usr/local/bin/coredns-debug
+    cp "$COREDNS_BIN" "$dest"
+    chmod +x "$dest"
+    ok "  coredns → $dest"
+fi
+
 # ── CNI 插件（如果已编译）────────────────────────────────────────────────────
 CNI_OUT="$RUNTIME_BUILD/cni-plugins"
 if [[ -d "$CNI_OUT" ]] && ls "$CNI_OUT"/* &>/dev/null; then
@@ -130,5 +140,6 @@ echo "  kubelet, kube-proxy"
 [[ -d "$CTD_BUILD" ]] && echo "  containerd, containerd-shim-runc-v2"
 [[ -f "$RUNC_BIN" ]] && echo "  runc"
 [[ -d "$CNI_OUT" ]] && echo "  CNI: $(ls "$CNI_OUT" 2>/dev/null | tr '\n' ' ')"
+[[ -f "$COREDNS_BIN" ]] && echo "  coredns-debug → /usr/local/bin/coredns-debug"
 echo ""
 echo "下一步: bash scripts/06-setup-debug-manifests.sh && make debug-all"
