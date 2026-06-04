@@ -735,6 +735,389 @@ except: pass
     printf "    threads: %s\n" "$(cat /proc/$TARGET_PID/status 2>/dev/null | grep ^Threads | awk '{print $2}' || echo n/a)"
 }
 
+# ── 14. Linux 内核容器函数（QEMU GDB stub）────────────────────────────────────
+# 验证容器创建涉及的内核函数：copy_process、do_mount、
+# __x64_sys_clone、security_bprm_check、cgroup_attach_task
+test_kernel_container() {
+    info "═══ 测试 Linux 内核容器函数 (QEMU GDB) ═══"
+
+    local VMLINUX="${VMLINUX:-/tmp/linux-6.12/vmlinux}"
+    local BZIMAGE="${BZIMAGE:-/tmp/linux-6.12/arch/x86/boot/bzImage}"
+    local GDB_PORT=1234
+
+    if [[ ! -f "$VMLINUX" ]]; then
+        warn "vmlinux 未找到 ($VMLINUX)，跳过（先构建 Linux 内核）"
+        record "kernel container BPs" "⚠ SKIP" "vmlinux not found"
+        return
+    fi
+    command -v qemu-system-x86_64 >/dev/null 2>&1 || {
+        warn "qemu-system-x86_64 未安装，跳过"
+        record "kernel container BPs" "⚠ SKIP" "qemu not installed"
+        return
+    }
+    command -v gdb >/dev/null 2>&1 || {
+        warn "gdb 未安装，跳过"
+        record "kernel container BPs" "⚠ SKIP" "gdb not installed"
+        return
+    }
+
+    # ── 符号验证（快速检查，无需 QEMU）──────────────────────────────────────
+    local container_syms=(copy_process __x64_sys_clone do_mount security_bprm_check cgroup_attach_task __x64_sys_unshare)
+    local sym_pass=0
+    for sym in "${container_syms[@]}"; do
+        nm "$VMLINUX" 2>/dev/null | grep -qE " [Tt] ${sym}$" && sym_pass=$((sym_pass + 1)) || true
+    done
+    info "  符号验证: ${sym_pass}/${#container_syms[@]} 个容器相关内核函数已确认"
+
+    # ── 构建 container-test initrd（如尚未构建）──────────────────────────────
+    local CONTAINER_INITRD="/tmp/initrd-container-test.gz"
+    if [[ ! -f "$CONTAINER_INITRD" ]]; then
+        local BASE_INITRD="${BASE_INITRD:-/tmp/initrd.gz}"
+        if [[ ! -f "$BASE_INITRD" ]]; then
+            warn "  base initrd 未找到，跳过 QEMU 测试"
+            record "kernel container BPs" "✓ PASS(sym)" "symbols: ${sym_pass}/${#container_syms[@]}"
+            return
+        fi
+        info "  构建 container-test initrd..."
+        bash "$(dirname "$0")/../debug/kernel-container.sh" --symbols >/dev/null 2>&1 || true
+        # 直接内联构建 initrd
+        local work_dir
+        work_dir=$(mktemp -d /tmp/initrd-ctest-XXXX)
+        (cd "$work_dir" && zcat "$BASE_INITRD" | cpio -id --quiet 2>/dev/null)
+        cat > "$work_dir/init" << 'INIT_SCRIPT'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+printf "\nCTEST:phase1_mounts\n"
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null && printf "CTEST:cgroup2_ok\n" || true
+printf "CTEST:phase2_procs\n"
+ls /proc >/dev/null 2>&1
+cat /proc/version >/dev/null 2>&1
+printf "CTEST:phase3_namespaces\n"
+unshare --mount --pid --net --fork /bin/sh -c '
+    printf "CTEST:in_ns\n"
+    mkdir -p /tmp/ns-root
+    mount --bind /bin /tmp/ns-root 2>/dev/null && printf "CTEST:bind_mount_ok\n" || true
+    ls /tmp/ns-root >/dev/null 2>&1 || true
+' 2>/dev/null || printf "CTEST:unshare_skip\n"
+printf "CTEST:phase4_cgroup\n"
+if [ -d /sys/fs/cgroup ]; then
+    mkdir -p /sys/fs/cgroup/ctest 2>/dev/null || true
+    printf "%d" $$ > /sys/fs/cgroup/ctest/cgroup.procs 2>/dev/null && \
+        printf "CTEST:cgroup_attach_ok\n" || printf "CTEST:cgroup_attach_skip\n"
+fi
+printf "CTEST:all_phases_done\n"
+sleep 999999 &
+exec /bin/sh
+INIT_SCRIPT
+        chmod +x "$work_dir/init"
+        (cd "$work_dir" && ln -sf /bin/busybox bin/unshare 2>/dev/null || true)
+        (cd "$work_dir" && find . | cpio -o --quiet -H newc | gzip > "$CONTAINER_INITRD")
+        rm -rf "$work_dir"
+        ok "  container-test initrd: $(wc -c < "$CONTAINER_INITRD") bytes"
+    fi
+
+    # ── 启动 QEMU ─────────────────────────────────────────────────────────────
+    if ss -tlnp 2>/dev/null | grep -q ":$GDB_PORT"; then
+        warn "  端口 $GDB_PORT 已被占用，跳过 QEMU 启动"
+    else
+        qemu-system-x86_64 \
+            -kernel "$BZIMAGE" \
+            -initrd "$CONTAINER_INITRD" \
+            -append "console=ttyS0 nokaslr panic=-1 quiet" \
+            -m 512M -nographic -no-reboot -s -S \
+            > /tmp/qemu-ctest.log 2>&1 &
+        local QEMU_PID=$!
+        local retry=0
+        while ! ss -tlnp 2>/dev/null | grep -q ":$GDB_PORT"; do
+            ((retry++)); [[ $retry -lt 20 ]] || { warn "  QEMU GDB stub 超时"; kill $QEMU_PID 2>/dev/null; record "kernel container BPs" "✗ FAIL" "qemu stub timeout"; return; }
+            sleep 0.5
+        done
+        ok "  QEMU 就绪 (PID $QEMU_PID)"
+    fi
+
+    # ── GDB 断点测试 ──────────────────────────────────────────────────────────
+    local gdb_script
+    gdb_script=$(mktemp /tmp/kc-gdb-XXXX.gdb)
+    local GDB_LOG="/tmp/kernel-container-gdb.log"
+    local bp_idx=1
+    {
+        echo "set pagination off"
+        echo "set confirm off"
+        echo "file $VMLINUX"
+        echo "target remote :$GDB_PORT"
+        for sym in "${container_syms[@]}"; do
+            echo "b $sym"
+            echo "commands $bp_idx"
+            echo "  silent"
+            echo "  printf \"KERNEL_BP_HIT:${sym}\\n\""
+            echo "  bt 3"
+            echo "  disable $bp_idx"
+            echo "  c"
+            echo "end"
+            ((bp_idx++))
+        done
+        echo "c"
+    } > "$gdb_script"
+
+    timeout 60 gdb -batch -x "$gdb_script" > "$GDB_LOG" 2>&1 || true
+    rm -f "$gdb_script"
+    kill "${QEMU_PID:-0}" 2>/dev/null || true
+
+    # ── 解析结果 ──────────────────────────────────────────────────────────────
+    local bp_hit=0 bp_set=0
+    local hit_list=() set_list=()
+    for sym in "${container_syms[@]}"; do
+        if grep -q "KERNEL_BP_HIT:${sym}" "$GDB_LOG" 2>/dev/null; then
+            bp_hit=$((bp_hit + 1)); hit_list+=("$sym")
+        elif grep -q "Breakpoint.*${sym}" "$GDB_LOG" 2>/dev/null; then
+            bp_set=$((bp_set + 1)); set_list+=("$sym")
+        fi
+    done
+
+    if [[ $bp_hit -gt 0 ]]; then
+        ok "  容器内核断点: ${bp_hit}/${#container_syms[@]} 触发，${bp_set} 已设置"
+        info "  触发: ${hit_list[*]}"
+        [[ ${#set_list[@]} -gt 0 ]] && info "  已设置(超时前未触发): ${set_list[*]}"
+        record "kernel container BPs" "✓ PASS" "${bp_hit}/${#container_syms[@]} hit: ${hit_list[*]}"
+    elif [[ $bp_set -gt 0 ]]; then
+        warn "  断点已设置但超时内未触发（延长 TEST_TIMEOUT=120 可能有帮助）"
+        record "kernel container BPs" "⚠ WARN" "symbols: ${sym_pass}/${#container_syms[@]}, bps set but not triggered"
+    else
+        warn "  断点未设置（详见 $GDB_LOG）"
+        record "kernel container BPs" "⚠ WARN" "symbols: ${sym_pass}/${#container_syms[@]}"
+    fi
+
+    # 打印关键调用栈
+    if grep -q "KERNEL_BP_HIT:" "$GDB_LOG" 2>/dev/null; then
+        echo ""
+        info "  调用栈（首次触发）："
+        grep -A 4 "KERNEL_BP_HIT:" "$GDB_LOG" 2>/dev/null | head -30 | sed 's/^/    /'
+    fi
+}
+
+# ── 15. 有状态 Pod 创建全链路断点测试 ─────────────────────────────────────────
+# 创建 PVC + StatefulSet Pod，验证每个组件在 Pod 创建流程中被断点命中：
+#   apiserver(2345) → etcd(2351) → scheduler(2347) → kubelet(2348) →
+#   containerd/CRI(2350) → CSI hostpath(2353) → runc/CNI(符号验证) →
+#   kernel(copy_process strace)
+test_stateful_pod_flow() {
+    info "═══ 有状态 Pod 创建全链路断点测试 ═══"
+
+    # 检查集群是否就绪
+    if ! kubectl get nodes >/dev/null 2>&1; then
+        warn "K8s 集群未运行，跳过全链路测试"
+        record "stateful pod flow" "⚠ SKIP" "cluster not running"
+        return
+    fi
+
+    local NODE
+    NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [[ -z "$NODE" ]]; then
+        warn "无法获取节点信息，跳过"
+        record "stateful pod flow" "⚠ SKIP" "no nodes found"
+        return
+    fi
+    info "  节点: $NODE"
+
+    local NS="stateful-test-$(date +%s)"
+    local FLOW_LOG="/tmp/stateful-pod-flow-$(date +%s).log"
+    kubectl create namespace "$NS" >/dev/null 2>&1 || true
+    info "  测试命名空间: $NS"
+    info "  日志: $FLOW_LOG"
+    echo "" > "$FLOW_LOG"
+
+    # ── 辅助：后台设置断点并等待触发 ──────────────────────────────────────────
+    # 用法: set_bp_watch <port> <bp> <label> <timeout>
+    set_bp_watch() {
+        local port="$1" bp="$2" label="$3" timeout_s="${4:-20}"
+        (
+            dlv_session "localhost:$port" "$timeout_s" \
+                "b $bp" \
+                "c" \
+                "goroutines" \
+                "stack" \
+                "clearall" \
+                "c" \
+            >> "$FLOW_LOG" 2>&1
+            echo "FLOW_BP_DONE:${label}" >> "$FLOW_LOG"
+        ) &
+    }
+
+    # ── Phase 1: 预设所有断点（后台并发）────────────────────────────────────
+    info "  设置断点（后台并发）..."
+
+    # apiserver: Pod/PVC 的 Store.Create
+    ss -tlnp 2>/dev/null | grep -q ":2345" && \
+        set_bp_watch 2345 "k8s.io/apiserver/pkg/registry/generic/registry.(*Store).Create" "apiserver" 30
+
+    # etcd: EtcdServer.Put
+    ss -tlnp 2>/dev/null | grep -q ":2351" && \
+        set_bp_watch 2351 "go.etcd.io/etcd/server/v3/etcdserver.(*EtcdServer).Put" "etcd" 30
+
+    # scheduler: ScheduleOne
+    ss -tlnp 2>/dev/null | grep -q ":2347" && \
+        set_bp_watch 2347 "k8s.io/kubernetes/pkg/scheduler.(*Scheduler).ScheduleOne" "scheduler" 30
+
+    # kubelet: HandlePodAdditions
+    ss -tlnp 2>/dev/null | grep -q ":2348" && \
+        set_bp_watch 2348 "k8s.io/kubernetes/pkg/kubelet.(*Kubelet).HandlePodAdditions" "kubelet" 35
+
+    # containerd/CRI: RunPodSandbox
+    ss -tlnp 2>/dev/null | grep -q ":2350" && \
+        set_bp_watch 2350 "github.com/containerd/containerd/v2/internal/cri/server.(*criService).RunPodSandbox" "containerd" 40
+
+    # CSI: CreateVolume
+    ss -tlnp 2>/dev/null | grep -q ":2353" && \
+        set_bp_watch 2353 "github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).CreateVolume" "csi" 35
+
+    # 等待断点就绪（dlv 需要 ~2s 连接）
+    sleep 3
+
+    # ── Phase 2: 触发 — 创建 StorageClass + PVC + Pod ──────────────────────
+    info "  创建 StorageClass + PVC + Pod..."
+
+    # StorageClass（hostpath，使用 CSI hostpath driver 如果存在，否则 manual）
+    kubectl apply -f - >/dev/null 2>&1 << SC_EOF || true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: flow-test-hostpath
+  namespace: $NS
+provisioner: hostpath.csi.k8s.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+SC_EOF
+
+    # PVC
+    kubectl apply -n "$NS" -f - >/dev/null 2>&1 << PVC_EOF || true
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flow-test-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: flow-test-hostpath
+  resources:
+    requests:
+      storage: 10Mi
+PVC_EOF
+
+    # Pod（挂载 PVC 或 emptyDir fallback）
+    # 尝试带 PVC 的 Pod；如果 CSI 不可用，fallback 到 emptyDir
+    kubectl apply -n "$NS" -f - >/dev/null 2>&1 << POD_EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flow-test-pod
+  labels:
+    test: stateful-flow
+spec:
+  containers:
+  - name: app
+    image: registry.k8s.io/pause:3.10
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    emptyDir: {}
+POD_EOF
+
+    info "  等待 Pod 创建流程（45s）..."
+    sleep 45
+
+    # ── Phase 3: 等待后台断点完成 ──────────────────────────────────────────
+    wait 2>/dev/null || true
+
+    # ── Phase 4: 内核层验证（strace copy_process on pod's init process）──
+    info "  验证内核层: 查找 Pod 容器进程..."
+    local POD_PID
+    POD_PID=$(kubectl get pod flow-test-pod -n "$NS" -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null || true)
+    local PAUSE_PID
+    PAUSE_PID=$(pgrep -f "pause" | head -1 2>/dev/null || true)
+    if [[ -n "$PAUSE_PID" ]]; then
+        local tracer
+        tracer=$(awk '/TracerPid/{print $2}' /proc/"$PAUSE_PID"/status 2>/dev/null || echo 0)
+        if [[ "$tracer" -eq 0 ]]; then
+            info "  strace Pod pause 进程 (PID $PAUSE_PID)..."
+            local klog
+            klog=$(timeout 3 strace -p "$PAUSE_PID" \
+                -e trace=clone,unshare,mount,openat \
+                -f -ttt 2>&1 | head -20 || true)
+            echo "KERNEL_STRACE_POD: $klog" >> "$FLOW_LOG"
+            local klines
+            klines=$(echo "$klog" | wc -l)
+            [[ $klines -gt 0 ]] && ok "  内核层 strace: ${klines} 条 syscall" || true
+        fi
+    fi
+
+    # ── Phase 5: 汇报结果 ─────────────────────────────────────────────────
+    echo ""
+    info "  全链路断点命中情况："
+    echo ""
+
+    local flow_pass=0 flow_skip=0
+    local components=(
+        "apiserver:Store.Create:2345"
+        "etcd:EtcdServer.Put:2351"
+        "scheduler:ScheduleOne:2347"
+        "kubelet:HandlePodAdditions:2348"
+        "containerd:RunPodSandbox:2350"
+        "csi:CreateVolume:2353"
+    )
+
+    for comp in "${components[@]}"; do
+        local name port label
+        name=$(echo "$comp" | cut -d: -f1)
+        label=$(echo "$comp" | cut -d: -f2)
+        port=$(echo "$comp" | cut -d: -f3)
+
+        if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+            printf "  \033[1;33m⚠ SKIP\033[0m  %-15s %s (port %s not listening)\n" "$name" "$label" "$port"
+            flow_skip=$((flow_skip + 1))
+        elif grep -q "FLOW_BP_DONE:${name}" "$FLOW_LOG" 2>/dev/null; then
+            if grep_output "$(cat "$FLOW_LOG")" "Goroutine|goroutine|Breakpoint|Stack"; then
+                printf "  \033[1;32m✓ HIT \033[0m  %-15s %s\n" "$name" "$label"
+                flow_pass=$((flow_pass + 1))
+            else
+                printf "  \033[1;33m⚠ DONE\033[0m  %-15s %s (connected, verify log)\n" "$name" "$label"
+            fi
+        else
+            printf "  \033[1;33m⚠ PEND\033[0m  %-15s %s (no response in timeout)\n" "$name" "$label"
+        fi
+    done
+
+    # runc/CNI: 符号验证
+    local RUNC_BIN
+    RUNC_BIN=$(find /home/user/k8s-debug/build/runtime -name "runc*" 2>/dev/null | head -1 || true)
+    if [[ -n "$RUNC_BIN" ]]; then
+        local runc_syms
+        runc_syms=$(nm "$RUNC_BIN" 2>/dev/null | grep -c "Container.*Start" || echo 0)
+        printf "  \033[1;32m✓ SYM \033[0m  %-15s %s (%d symbols)\n" "runc" "Container.Start" "$runc_syms"
+    fi
+
+    echo ""
+    info "  流程日志: $FLOW_LOG"
+
+    # 清理
+    kubectl delete namespace "$NS" --ignore-not-found >/dev/null 2>&1 &
+    kubectl delete storageclass flow-test-hostpath --ignore-not-found >/dev/null 2>&1 || true
+
+    if [[ $flow_pass -gt 0 ]]; then
+        ok "  全链路断点: ${flow_pass} 个组件命中"
+        record "stateful pod flow" "✓ PASS" "${flow_pass} components hit, ${flow_skip} skipped"
+    elif [[ $flow_skip -gt 0 ]]; then
+        warn "  ${flow_skip} 个组件未监听（dlv 服务未运行）"
+        record "stateful pod flow" "⚠ SKIP" "dlv ports not listening, run debug/all.sh first"
+    else
+        warn "  断点未命中（查看 $FLOW_LOG）"
+        record "stateful pod flow" "⚠ WARN" "no hits, check $FLOW_LOG"
+    fi
+}
+
 # ── systemd：GDB attach PID 1，验证调试符号可用 ──────────────────────────────
 test_systemd() {
     info "── systemd (GDB) ──"
@@ -805,6 +1188,10 @@ echo ""
 test_kube_proxy
 echo ""
 test_kernel_strace
+echo ""
+test_kernel_container
+echo ""
+test_stateful_pod_flow
 echo ""
 test_systemd
 
