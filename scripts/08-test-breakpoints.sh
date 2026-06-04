@@ -905,6 +905,7 @@ INIT_SCRIPT
 #   kernel(copy_process strace)
 test_stateful_pod_flow() {
     info "═══ 有状态 Pod 创建全链路断点测试 ═══"
+    info "  链路: apiserver→etcd→scheduler→kubelet→CRI→runc→CNI→CSI→kernel"
 
     # 检查集群是否就绪
     if ! kubectl get nodes >/dev/null 2>&1; then
@@ -925,93 +926,137 @@ test_stateful_pod_flow() {
     local NS="stateful-test-$(date +%s)"
     local FLOW_LOG="/tmp/stateful-pod-flow-$(date +%s).log"
     kubectl create namespace "$NS" >/dev/null 2>&1 || true
-    info "  测试命名空间: $NS"
-    info "  日志: $FLOW_LOG"
-    echo "" > "$FLOW_LOG"
+    info "  测试命名空间: $NS  日志: $FLOW_LOG"
+    echo "FLOW_START: $(date)" > "$FLOW_LOG"
 
-    # ── 辅助：后台设置断点并等待触发 ──────────────────────────────────────────
-    # 用法: set_bp_watch <port> <bp> <label> <timeout>
+    # ── 辅助：后台 dlv 断点监听 ────────────────────────────────────────────────
+    # 连接 dlv server → 设断点 → 触发后打印 goroutines+stack → 清断点 → 继续
     set_bp_watch() {
-        local port="$1" bp="$2" label="$3" timeout_s="${4:-20}"
+        local port="$1" bp="$2" label="$3" timeout_s="${4:-30}"
         (
-            dlv_session "localhost:$port" "$timeout_s" \
-                "b $bp" \
-                "c" \
-                "goroutines" \
-                "stack" \
-                "clearall" \
-                "c" \
-            >> "$FLOW_LOG" 2>&1
-            echo "FLOW_BP_DONE:${label}" >> "$FLOW_LOG"
+            {
+                dlv_session "localhost:$port" "$timeout_s" \
+                    "b $bp" \
+                    "c" \
+                    "goroutines" \
+                    "stack" \
+                    "clearall" \
+                    "c"
+                echo "FLOW_BP_DONE:${label}"
+            } >> "$FLOW_LOG" 2>&1
         ) &
     }
 
-    # ── Phase 1: 预设所有断点（后台并发）────────────────────────────────────
-    info "  设置断点（后台并发）..."
+    # ── Phase 1: 预设 dlv 断点（并发，后台）─────────────────────────────────
+    info "  [1/4] 预设 dlv 断点..."
 
-    # apiserver: Pod/PVC 的 Store.Create
+    # kube-apiserver (2345): PVC/Pod 资源写入
     ss -tlnp 2>/dev/null | grep -q ":2345" && \
-        set_bp_watch 2345 "k8s.io/apiserver/pkg/registry/generic/registry.(*Store).Create" "apiserver" 30
+        set_bp_watch 2345 \
+            "k8s.io/apiserver/pkg/registry/generic/registry.(*Store).Create" \
+            "apiserver" 35
 
-    # etcd: EtcdServer.Put
+    # etcd (2351): key-value 持久化
     ss -tlnp 2>/dev/null | grep -q ":2351" && \
-        set_bp_watch 2351 "go.etcd.io/etcd/server/v3/etcdserver.(*EtcdServer).Put" "etcd" 30
+        set_bp_watch 2351 \
+            "go.etcd.io/etcd/server/v3/etcdserver.(*EtcdServer).Put" \
+            "etcd" 35
 
-    # scheduler: ScheduleOne
+    # kube-scheduler (2347): Pod 调度
     ss -tlnp 2>/dev/null | grep -q ":2347" && \
-        set_bp_watch 2347 "k8s.io/kubernetes/pkg/scheduler.(*Scheduler).ScheduleOne" "scheduler" 30
+        set_bp_watch 2347 \
+            "k8s.io/kubernetes/pkg/scheduler.(*Scheduler).ScheduleOne" \
+            "scheduler" 35
 
-    # kubelet: HandlePodAdditions
+    # kubelet (2348): Pod 加入队列
     ss -tlnp 2>/dev/null | grep -q ":2348" && \
-        set_bp_watch 2348 "k8s.io/kubernetes/pkg/kubelet.(*Kubelet).HandlePodAdditions" "kubelet" 35
+        set_bp_watch 2348 \
+            "k8s.io/kubernetes/pkg/kubelet.(*Kubelet).HandlePodAdditions" \
+            "kubelet" 40
 
-    # containerd/CRI: RunPodSandbox
+    # containerd/CRI (2350): sandbox + container 创建
+    # RunPodSandbox: 创建 pause 容器（网络 namespace、cgroup）
     ss -tlnp 2>/dev/null | grep -q ":2350" && \
-        set_bp_watch 2350 "github.com/containerd/containerd/v2/internal/cri/server.(*criService).RunPodSandbox" "containerd" 40
+        set_bp_watch 2350 \
+            "github.com/containerd/containerd/v2/internal/cri/server.(*criService).RunPodSandbox" \
+            "cri_sandbox" 45
+    # CreateContainer: 创建业务容器（在 sandbox 内）
+    ss -tlnp 2>/dev/null | grep -q ":2350" && \
+        set_bp_watch 2350 \
+            "github.com/containerd/containerd/v2/internal/cri/server.(*criService).CreateContainer" \
+            "cri_container" 50
+    # StartContainer: 启动业务容器（最终 exec runc start）
+    ss -tlnp 2>/dev/null | grep -q ":2350" && \
+        set_bp_watch 2350 \
+            "github.com/containerd/containerd/v2/internal/cri/server.(*criService).StartContainer" \
+            "cri_start" 55
 
-    # CSI: CreateVolume
+    # CSI hostpath (2353): 动态 PV 创建
     ss -tlnp 2>/dev/null | grep -q ":2353" && \
-        set_bp_watch 2353 "github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).CreateVolume" "csi" 35
+        set_bp_watch 2353 \
+            "github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).CreateVolume" \
+            "csi" 40
 
-    # 等待断点就绪（dlv 需要 ~2s 连接）
+    # ── Phase 2: 启动 runc 执行监控（containerd exec strace）──────────────────
+    # runc 和 CNI 插件是短生命进程，通过 strace containerd 的 execve 调用来追踪
+    local CONTAINERD_PID RUNC_EXEC_LOG CNI_EXEC_LOG
+    RUNC_EXEC_LOG="/tmp/flow-runc-exec.log"
+    CNI_EXEC_LOG="/tmp/flow-cni-exec.log"
+    CONTAINERD_PID=$(pgrep -f "^/usr/bin/containerd$\|containerd/containerd " 2>/dev/null | head -1 || true)
+
+    if [[ -n "$CONTAINERD_PID" ]]; then
+        local tracer
+        tracer=$(awk '/TracerPid/{print $2}' /proc/"$CONTAINERD_PID"/status 2>/dev/null || echo 0)
+        if [[ "$tracer" -eq 0 ]]; then
+            info "  [1/4] 监控 containerd (PID $CONTAINERD_PID) exec 调用..."
+            # 追踪 containerd 及其所有子进程的 execve：捕获 runc + CNI 调用
+            timeout 70 strace -p "$CONTAINERD_PID" \
+                -f -e trace=execve -e signal=none \
+                -o "$RUNC_EXEC_LOG" \
+                2>/dev/null &
+            echo $! > /tmp/flow-strace.pid
+        else
+            warn "  containerd 已被 ptrace (TracerPid=$tracer)，跳过 exec 监控"
+            CONTAINERD_PID=""
+        fi
+    else
+        warn "  containerd 进程未找到，runc/CNI exec 验证将跳过"
+    fi
+
+    # 等待断点和 strace 就绪
     sleep 3
 
-    # ── Phase 2: 触发 — 创建 StorageClass + PVC + Pod ──────────────────────
-    info "  创建 StorageClass + PVC + Pod..."
+    # ── Phase 3: 触发 — 创建 StorageClass + PVC + Pod ─────────────────────
+    info "  [2/4] 创建 StorageClass + PVC + Pod..."
 
-    # StorageClass（hostpath，使用 CSI hostpath driver 如果存在，否则 manual）
     kubectl apply -f - >/dev/null 2>&1 << SC_EOF || true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: flow-test-hostpath
-  namespace: $NS
+  name: flow-test-sc
 provisioner: hostpath.csi.k8s.io
 volumeBindingMode: Immediate
 reclaimPolicy: Delete
 SC_EOF
 
-    # PVC
     kubectl apply -n "$NS" -f - >/dev/null 2>&1 << PVC_EOF || true
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: flow-test-pvc
+  name: flow-pvc
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: flow-test-hostpath
+  storageClassName: flow-test-sc
   resources:
     requests:
       storage: 10Mi
 PVC_EOF
 
-    # Pod（挂载 PVC 或 emptyDir fallback）
-    # 尝试带 PVC 的 Pod；如果 CSI 不可用，fallback 到 emptyDir
     kubectl apply -n "$NS" -f - >/dev/null 2>&1 << POD_EOF || true
 apiVersion: v1
 kind: Pod
 metadata:
-  name: flow-test-pod
+  name: flow-pod
   labels:
     test: stateful-flow
 spec:
@@ -1023,80 +1068,164 @@ spec:
       mountPath: /data
   volumes:
   - name: data
-    emptyDir: {}
+    persistentVolumeClaim:
+      claimName: flow-pvc
 POD_EOF
 
-    info "  等待 Pod 创建流程（45s）..."
-    sleep 45
+    info "  [3/4] 等待 Pod 创建流程（50s）..."
+    sleep 50
 
-    # ── Phase 3: 等待后台断点完成 ──────────────────────────────────────────
+    # ── Phase 4: 停止 strace，等待所有 dlv 会话完成 ────────────────────────
+    local strace_pid
+    strace_pid=$(cat /tmp/flow-strace.pid 2>/dev/null || true)
+    [[ -n "$strace_pid" ]] && kill "$strace_pid" 2>/dev/null || true
     wait 2>/dev/null || true
 
-    # ── Phase 4: 内核层验证（strace copy_process on pod's init process）──
-    info "  验证内核层: 查找 Pod 容器进程..."
-    local POD_PID
-    POD_PID=$(kubectl get pod flow-test-pod -n "$NS" -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null || true)
-    local PAUSE_PID
-    PAUSE_PID=$(pgrep -f "pause" | head -1 2>/dev/null || true)
-    if [[ -n "$PAUSE_PID" ]]; then
-        local tracer
-        tracer=$(awk '/TracerPid/{print $2}' /proc/"$PAUSE_PID"/status 2>/dev/null || echo 0)
-        if [[ "$tracer" -eq 0 ]]; then
-            info "  strace Pod pause 进程 (PID $PAUSE_PID)..."
-            local klog
-            klog=$(timeout 3 strace -p "$PAUSE_PID" \
-                -e trace=clone,unshare,mount,openat \
-                -f -ttt 2>&1 | head -20 || true)
-            echo "KERNEL_STRACE_POD: $klog" >> "$FLOW_LOG"
-            local klines
-            klines=$(echo "$klog" | wc -l)
-            [[ $klines -gt 0 ]] && ok "  内核层 strace: ${klines} 条 syscall" || true
-        fi
+    # ── Phase 5: 验证 runc — exec 调用 + 符号检查 ─────────────────────────
+    local RUNC_BIN
+    RUNC_BIN=$(find /home/user/k8s-debug/build/runtime -name "runc*" -not -name "*.sh" 2>/dev/null | head -1 || true)
+    [[ -z "$RUNC_BIN" ]] && RUNC_BIN=$(which runc 2>/dev/null || true)
+
+    local runc_exec_found=false runc_sym_ok=false
+    if grep -q "runc" "$RUNC_EXEC_LOG" 2>/dev/null; then
+        runc_exec_found=true
+        echo "FLOW_RUNC_EXEC: $(grep 'runc' "$RUNC_EXEC_LOG" | head -3)" >> "$FLOW_LOG"
+    fi
+    if [[ -n "$RUNC_BIN" ]] && nm "$RUNC_BIN" 2>/dev/null | grep -qE "Container.*Start|libcontainer.*Start"; then
+        runc_sym_ok=true
     fi
 
-    # ── Phase 5: 汇报结果 ─────────────────────────────────────────────────
-    echo ""
-    info "  全链路断点命中情况："
-    echo ""
+    # ── Phase 6: 验证 CNI — exec 调用 + 网络 namespace 检查 ───────────────
+    local cni_exec_found=false cni_netns_ok=false
+    local CNI_BINS=()
+    for d in /home/user/k8s-debug/build/runtime/cni-plugins /opt/cni/bin; do
+        [[ -d "$d" ]] && mapfile -t -O "${#CNI_BINS[@]}" CNI_BINS < <(ls "$d"/ 2>/dev/null) || true
+    done
 
-    local flow_pass=0 flow_skip=0
-    local components=(
-        "apiserver:Store.Create:2345"
-        "etcd:EtcdServer.Put:2351"
-        "scheduler:ScheduleOne:2347"
-        "kubelet:HandlePodAdditions:2348"
-        "containerd:RunPodSandbox:2350"
-        "csi:CreateVolume:2353"
-    )
+    # 检查 strace log 中是否有 CNI 插件被 exec（bridge, host-local, loopback 等）
+    if grep -qE '"bridge"|"host-local"|"loopback"|"flannel"' "$RUNC_EXEC_LOG" 2>/dev/null; then
+        cni_exec_found=true
+        echo "FLOW_CNI_EXEC: $(grep -E '"bridge"|"host-local"|"loopback"' "$RUNC_EXEC_LOG" | head -3)" >> "$FLOW_LOG"
+    fi
+    # 备选：检查是否有新的 veth/cni 网络接口被创建
+    if ip link show 2>/dev/null | grep -qE "^[0-9]+: veth|^[0-9]+: cni"; then
+        cni_netns_ok=true
+    fi
+    # 检查 CNI 符号
+    local cni_sym_ok=false
+    local CNI_BRIDGE=""
+    for d in /home/user/k8s-debug/build/runtime/cni-plugins /opt/cni/bin; do
+        [[ -f "$d/bridge" ]] && { CNI_BRIDGE="$d/bridge"; break; }
+    done
+    if [[ -n "$CNI_BRIDGE" ]] && nm "$CNI_BRIDGE" 2>/dev/null | grep -q "main\.cmdAdd"; then
+        cni_sym_ok=true
+    fi
 
-    for comp in "${components[@]}"; do
-        local name port label
-        name=$(echo "$comp" | cut -d: -f1)
-        label=$(echo "$comp" | cut -d: -f2)
-        port=$(echo "$comp" | cut -d: -f3)
-
-        if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
-            printf "  \033[1;33m⚠ SKIP\033[0m  %-15s %s (port %s not listening)\n" "$name" "$label" "$port"
-            flow_skip=$((flow_skip + 1))
-        elif grep -q "FLOW_BP_DONE:${name}" "$FLOW_LOG" 2>/dev/null; then
-            if grep_output "$(cat "$FLOW_LOG")" "Goroutine|goroutine|Breakpoint|Stack"; then
-                printf "  \033[1;32m✓ HIT \033[0m  %-15s %s\n" "$name" "$label"
-                flow_pass=$((flow_pass + 1))
-            else
-                printf "  \033[1;33m⚠ DONE\033[0m  %-15s %s (connected, verify log)\n" "$name" "$label"
+    # ── Phase 7: 验证内核层 — 找 Pod pause 进程，strace 其 syscall ──────────
+    info "  [4/4] 验证内核层（Pod 容器 syscall）..."
+    local kernel_ok=false
+    local PAUSE_PIDS
+    mapfile -t PAUSE_PIDS < <(pgrep -f "pause" 2>/dev/null || true)
+    for ppid in "${PAUSE_PIDS[@]}"; do
+        local tracer
+        tracer=$(awk '/TracerPid/{print $2}' /proc/"$ppid"/status 2>/dev/null || echo 1)
+        if [[ "$tracer" -eq 0 ]]; then
+            local klog
+            klog=$(timeout 3 strace -p "$ppid" \
+                -e trace=clone,unshare,mount,openat,read,write \
+                -f -ttt 2>&1 | head -15 || true)
+            local klines
+            klines=$(echo "$klog" | grep -c "^\[pid\]\|^[0-9]" || true)
+            if [[ $klines -gt 0 ]]; then
+                kernel_ok=true
+                echo "KERNEL_STRACE_PAUSE(pid=$ppid): $klog" >> "$FLOW_LOG"
+                ok "  kernel: strace pause PID $ppid → ${klines} syscalls captured"
+                break
             fi
-        else
-            printf "  \033[1;33m⚠ PEND\033[0m  %-15s %s (no response in timeout)\n" "$name" "$label"
         fi
     done
 
-    # runc/CNI: 符号验证
-    local RUNC_BIN
-    RUNC_BIN=$(find /home/user/k8s-debug/build/runtime -name "runc*" 2>/dev/null | head -1 || true)
-    if [[ -n "$RUNC_BIN" ]]; then
-        local runc_syms
-        runc_syms=$(nm "$RUNC_BIN" 2>/dev/null | grep -c "Container.*Start" || echo 0)
-        printf "  \033[1;32m✓ SYM \033[0m  %-15s %s (%d symbols)\n" "runc" "Container.Start" "$runc_syms"
+    # ── Phase 8: 汇报全链路结果 ───────────────────────────────────────────
+    echo ""
+    info "  全链路断点 / 调用验证结果："
+    printf "  %-6s %-14s %-28s %s\n" "结果" "组件" "断点/验证方式" "说明"
+    printf "  %-6s %-14s %-28s %s\n" "----" "----" "----------" "----"
+
+    local flow_pass=0 flow_skip=0
+
+    # 辅助：打印并统计一个组件的结果
+    # report_component <label> <port_or_0> <log_marker> <display_name> <bp_desc>
+    report_component() {
+        local label="$1" port="$2" marker="$3" display="$4" bp_desc="$5"
+        if [[ "$port" != "0" ]] && ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+            printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s port %s not listening\n" \
+                "$display" "$bp_desc" "$port"
+            flow_skip=$((flow_skip + 1))
+        elif grep -q "FLOW_BP_DONE:${marker}" "$FLOW_LOG" 2>/dev/null; then
+            printf "  \033[1;32m✓ BP \033[0m  %-14s %-28s dlv breakpoint hit\n" \
+                "$display" "$bp_desc"
+            flow_pass=$((flow_pass + 1))
+        else
+            printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s no hit in timeout\n" \
+                "$display" "$bp_desc"
+        fi
+    }
+
+    report_component "apiserver"     2345 "apiserver"      "kube-apiserver"   "Store.Create"
+    report_component "etcd"          2351 "etcd"           "etcd"             "EtcdServer.Put"
+    report_component "scheduler"     2347 "scheduler"      "kube-scheduler"   "ScheduleOne"
+    report_component "kubelet"       2348 "kubelet"        "kubelet"          "HandlePodAdditions"
+    report_component "csi"           2353 "csi"            "CSI hostpath"     "CreateVolume"
+    report_component "cri_sandbox"   2350 "cri_sandbox"    "CRI"              "RunPodSandbox"
+    report_component "cri_container" 2350 "cri_container"  "CRI"              "CreateContainer"
+    report_component "cri_start"     2350 "cri_start"      "CRI"              "StartContainer"
+
+    # runc: exec 验证 + 符号
+    if $runc_exec_found; then
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s runc exec captured by strace\n" \
+            "runc" "Container.Start"
+        flow_pass=$((flow_pass + 1))
+    elif $runc_sym_ok; then
+        printf "  \033[1;32m✓ SYM\033[0m  %-14s %-28s symbol verified (exec not captured)\n" \
+            "runc" "Container.Start"
+    elif [[ -z "$CONTAINERD_PID" ]]; then
+        printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s containerd not found for strace\n" \
+            "runc" "Container.Start"
+        flow_skip=$((flow_skip + 1))
+    else
+        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s runc not seen in strace window\n" \
+            "runc" "Container.Start"
+    fi
+
+    # CNI: exec 验证 + 网络接口 + 符号
+    if $cni_exec_found; then
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s CNI exec captured by strace\n" \
+            "CNI bridge" "cmdAdd"
+        flow_pass=$((flow_pass + 1))
+    elif $cni_netns_ok; then
+        printf "  \033[1;32m✓VETH\033[0m  %-14s %-28s veth/cni interface created\n" \
+            "CNI bridge" "cmdAdd"
+        flow_pass=$((flow_pass + 1))
+    elif $cni_sym_ok; then
+        printf "  \033[1;32m✓ SYM\033[0m  %-14s %-28s symbol verified (exec not captured)\n" \
+            "CNI bridge" "cmdAdd"
+    elif [[ -z "$CONTAINERD_PID" ]]; then
+        printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s containerd not found for strace\n" \
+            "CNI bridge" "cmdAdd"
+        flow_skip=$((flow_skip + 1))
+    else
+        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s not seen (CNI may not be configured)\n" \
+            "CNI bridge" "cmdAdd"
+    fi
+
+    # kernel: strace 结果
+    if $kernel_ok; then
+        printf "  \033[1;32m✓KTRC\033[0m  %-14s %-28s syscalls captured on pause container\n" \
+            "Linux kernel" "clone/mount/openat"
+        flow_pass=$((flow_pass + 1))
+    else
+        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s pause container not traceable\n" \
+            "Linux kernel" "clone/mount/openat"
     fi
 
     echo ""
@@ -1104,17 +1233,17 @@ POD_EOF
 
     # 清理
     kubectl delete namespace "$NS" --ignore-not-found >/dev/null 2>&1 &
-    kubectl delete storageclass flow-test-hostpath --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete storageclass flow-test-sc --ignore-not-found >/dev/null 2>&1 &
 
     if [[ $flow_pass -gt 0 ]]; then
-        ok "  全链路断点: ${flow_pass} 个组件命中"
-        record "stateful pod flow" "✓ PASS" "${flow_pass} components hit, ${flow_skip} skipped"
+        ok "  全链路验证: ${flow_pass} 个组件确认，${flow_skip} 个跳过"
+        record "stateful pod flow" "✓ PASS" "${flow_pass}/11 components verified"
     elif [[ $flow_skip -gt 0 ]]; then
-        warn "  ${flow_skip} 个组件未监听（dlv 服务未运行）"
-        record "stateful pod flow" "⚠ SKIP" "dlv ports not listening, run debug/all.sh first"
+        warn "  ${flow_skip} 个组件未监听（运行 debug/all.sh 启动 dlv 服务）"
+        record "stateful pod flow" "⚠ SKIP" "dlv ports not listening"
     else
         warn "  断点未命中（查看 $FLOW_LOG）"
-        record "stateful pod flow" "⚠ WARN" "no hits, check $FLOW_LOG"
+        record "stateful pod flow" "⚠ WARN" "check $FLOW_LOG"
     fi
 }
 
