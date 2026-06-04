@@ -44,9 +44,9 @@
 ### 阶段 3：网络链路
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `10-service-endpoints.md` | Service + Endpoints + EndpointSlice | ⬜ |
-| `11-ingress.md` | Ingress + IngressClass | ⬜ |
-| `12-networkpolicy.md` | NetworkPolicy | ⬜ |
+| `10-service-endpoints.md` | Service + Endpoints + EndpointSlice | ✅ |
+| `11-ingress.md` | Ingress + IngressClass | ✅ |
+| `12-networkpolicy.md` | NetworkPolicy | ✅ |
 
 ### 阶段 4：弹性与调度
 | 文档 | 资源 | 状态 |
