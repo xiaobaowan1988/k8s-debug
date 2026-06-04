@@ -28,6 +28,7 @@ if [[ "$MODE" == "restore" ]]; then
     pkill -f "dlv exec.*kube-apiserver"          2>/dev/null || true
     pkill -f "dlv exec.*kube-controller-manager" 2>/dev/null || true
     pkill -f "dlv exec.*kube-scheduler"          2>/dev/null || true
+    pkill -f "dlv exec.*etcd"                    2>/dev/null || true
     sleep 2
 
     [[ -d "$BACKUP_DIR" ]] || die "无备份目录 $BACKUP_DIR"
@@ -64,9 +65,13 @@ if [[ -L "$DLV" ]]; then
 fi
 
 # 检查 debug 二进制
-for bin in kube-apiserver kube-controller-manager kube-scheduler; do
+for bin in kube-apiserver kube-controller-manager kube-scheduler etcd; do
     host_bin="/usr/local/bin/$bin"
     if [[ ! -f "$host_bin" ]]; then
+        if [[ "$bin" == "etcd" ]]; then
+            warn "  $host_bin 不存在，etcd 将跳过（先运行 make build-etcd && make inject-binaries）"
+            continue
+        fi
         die "$host_bin 不存在，先运行 make build-k8s && make inject-binaries"
     fi
     has_dwarf=$(readelf -S "$host_bin" 2>/dev/null | grep -c "\.debug_info" || true)
@@ -184,20 +189,28 @@ PYEOF
 }
 
 # ── 执行切换 ──────────────────────────────────────────────────────────────────
+# 组件列表：component:port — etcd 仅在二进制存在时添加
+COMPONENTS=("kube-apiserver:2345" "kube-controller-manager:2346" "kube-scheduler:2347")
+[[ -f "/usr/local/bin/etcd" ]] && COMPONENTS+=("etcd:2351")
+
 # 先生成所有 launcher（manifest 还在时提取参数）
 declare -A LAUNCHERS
-for pair in "kube-apiserver:2345" "kube-controller-manager:2346" "kube-scheduler:2347"; do
+for pair in "${COMPONENTS[@]}"; do
     component="${pair%%:*}"
     port="${pair##*:}"
+    manifest="$MANIFEST_DIR/${component}.yaml"
+    [[ -f "$manifest" ]] || { warn "  $manifest 不存在，跳过 $component"; continue; }
     launcher=$(make_launcher "$component" "$port") || die "生成 launcher 失败: $component"
     LAUNCHERS["$component"]="$launcher"
     ok "  launcher 已生成: $launcher"
 done
 
 # 停容器并以 dlv exec 方式在 host 启动
-for pair in "kube-apiserver:2345" "kube-controller-manager:2346" "kube-scheduler:2347"; do
+for pair in "${COMPONENTS[@]}"; do
     component="${pair%%:*}"
     port="${pair##*:}"
+
+    [[ -v "LAUNCHERS[$component]" ]] || continue
 
     # 禁用 manifest（kubelet 检测到 manifest 消失后会停容器）
     mv "$MANIFEST_DIR/${component}.yaml" \
@@ -225,10 +238,13 @@ done
 
 # ── 等待 dlv 端口就绪 ────────────────────────────────────────────────────────
 info "等待 dlv 端口就绪（host 进程直接启动，通常 <15s）..."
-declare -A PORT_COMP=([2345]="kube-apiserver" [2346]="kube-controller-manager" [2347]="kube-scheduler")
+declare -A PORT_COMP=([2345]="kube-apiserver" [2346]="kube-controller-manager" [2347]="kube-scheduler" [2351]="etcd")
 all_ready=true
 
-for port in 2345 2346 2347; do
+PORTS=(2345 2346 2347)
+[[ -v "LAUNCHERS[etcd]" ]] && PORTS+=(2351)
+
+for port in "${PORTS[@]}"; do
     comp="${PORT_COMP[$port]}"
     ready=false
     for i in $(seq 1 45); do
@@ -251,8 +267,8 @@ if $all_ready; then
     ok "所有控制平面组件已以 dlv exec host 模式启动"
 else
     warn "部分组件未就绪，请检查日志"
-    for comp in kube-apiserver kube-controller-manager kube-scheduler; do
-        echo "  cat /tmp/dlv-$comp.log"
+    for comp in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+        [[ -f "/tmp/dlv-${comp}.log" ]] && echo "  cat /tmp/dlv-$comp.log"
     done
 fi
 
@@ -261,9 +277,11 @@ echo "连接命令:"
 echo "  dlv connect localhost:2345   # kube-apiserver"
 echo "  dlv connect localhost:2346   # kube-controller-manager"
 echo "  dlv connect localhost:2347   # kube-scheduler"
+[[ -v "LAUNCHERS[etcd]" ]] && echo "  dlv connect localhost:2351   # etcd"
 echo ""
 echo "日志:"
 echo "  tail -f /tmp/dlv-kube-apiserver.log"
 echo "  tail -f /tmp/dlv-kube-scheduler.log"
+[[ -v "LAUNCHERS[etcd]" ]] && echo "  tail -f /tmp/dlv-etcd.log"
 echo ""
 echo "恢复容器模式: bash scripts/06-setup-debug-manifests.sh restore"

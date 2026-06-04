@@ -16,10 +16,10 @@ info "containerd PID: $CTD_PID"
 echo ""
 echo "断点建议 (containerd CRI 层):"
 echo ""
-echo "  b github.com/containerd/containerd/pkg/cri/server.(*criService).RunPodSandbox"
-echo "  b github.com/containerd/containerd/pkg/cri/server.(*criService).CreateContainer"
-echo "  b github.com/containerd/containerd/pkg/cri/server.(*criService).StartContainer"
-echo "  b github.com/containerd/containerd/runtime/v2.(*TaskManager).Create"
+echo "  b github.com/containerd/containerd/v2/internal/cri/server.(*criService).RunPodSandbox"
+echo "  b github.com/containerd/containerd/v2/internal/cri/server.(*criService).CreateContainer"
+echo "  b github.com/containerd/containerd/v2/internal/cri/server.(*criService).StartContainer"
+echo "  b github.com/containerd/containerd/v2/internal/cri/instrument.(*instrumentedService).RunPodSandbox"
 echo ""
 echo "辅助工具:"
 echo "  ctr -n k8s.io containers list"
@@ -36,6 +36,7 @@ dlv attach "${CTD_PID}" \
     --listen="0.0.0.0:${DLV_PORT}" \
     --api-version=2 \
     --accept-multiclient \
+    --continue \
     --check-go-version=false \
     > /tmp/dlv-containerd.log 2>&1 &
 disown

@@ -3,7 +3,9 @@
 set -euo pipefail
 
 CNI_SRC="${1:-$HOME/k8s-src/cni-plugins}"
-RUNTIME_BUILD="${2:-$(dirname "$0")/../build/runtime}"
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNTIME_BUILD="${2:-$_SCRIPT_DIR/../build/runtime}"
+RUNTIME_BUILD="$(mkdir -p "$RUNTIME_BUILD" && cd "$RUNTIME_BUILD" && pwd)"
 
 info()  { echo -e "\033[1;34m[INFO]\033[0m  $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m  $*"; }

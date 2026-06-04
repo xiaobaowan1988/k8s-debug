@@ -48,6 +48,17 @@ if [[ -f "$K8S_BUILD/kubelet" ]]; then
     chmod +x /usr/bin/kubelet
 fi
 
+# ── etcd（如果已编译）────────────────────────────────────────────────────────
+ETCD_BIN="$RUNTIME_BUILD/etcd"
+if [[ -f "$ETCD_BIN" ]]; then
+    info "注入 etcd"
+    dest=/usr/local/bin/etcd
+    [[ -f "$dest" ]] && [[ ! -f "${dest}.orig" ]] && cp "$dest" "${dest}.orig"
+    cp "$ETCD_BIN" "$dest"
+    chmod +x "$dest"
+    ok "  etcd → $dest"
+fi
+
 # ── containerd（如果已编译）──────────────────────────────────────────────────
 CTD_BUILD="$RUNTIME_BUILD/containerd-bin"
 if [[ -d "$CTD_BUILD" ]]; then
