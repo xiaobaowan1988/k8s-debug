@@ -1025,30 +1025,33 @@ test_stateful_pod_flow() {
             "github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).CreateVolume" \
             "csi" 40
 
-    # ── Phase 2: 启动 runc 执行监控（containerd exec strace）──────────────────
-    # runc 和 CNI 插件是短生命进程，通过 strace containerd 的 execve 调用来追踪
-    local CONTAINERD_PID RUNC_EXEC_LOG CNI_EXEC_LOG
-    RUNC_EXEC_LOG="/tmp/flow-runc-exec.log"
-    CNI_EXEC_LOG="/tmp/flow-cni-exec.log"
+    # ── Phase 2: 启动 containerd syscall 监控（strace）───────────────────────
+    # 单次 strace 追踪 containerd 及其子进程的所有关键 syscall：
+    #   execve  → 捕获 runc/CNI 插件的 exec 调用
+    #   unshare → RunPodSandbox 建 netns (netns_linux.go:116) → __x64_sys_unshare
+    #   mount   → netns bind mount (netns_linux.go:130) + overlay rootfs → do_mount
+    #   clone   → runc fork 容器进程 → copy_process
+    #   openat  → cgroup.procs 写入 → cgroup_attach_task
+    local CONTAINERD_PID STRACE_LOG
+    STRACE_LOG="/tmp/flow-strace.log"
     CONTAINERD_PID=$(pgrep -f "^/usr/bin/containerd$\|containerd/containerd " 2>/dev/null | head -1 || true)
 
     if [[ -n "$CONTAINERD_PID" ]]; then
         local tracer
         tracer=$(awk '/TracerPid/{print $2}' /proc/"$CONTAINERD_PID"/status 2>/dev/null || echo 0)
         if [[ "$tracer" -eq 0 ]]; then
-            info "  [1/4] 监控 containerd (PID $CONTAINERD_PID) exec 调用..."
-            # 追踪 containerd 及其所有子进程的 execve：捕获 runc + CNI 调用
+            info "  [1/4] 监控 containerd (PID $CONTAINERD_PID) syscall + exec..."
             timeout 70 strace -p "$CONTAINERD_PID" \
-                -f -e trace=execve -e signal=none \
-                -o "$RUNC_EXEC_LOG" \
+                -f -e trace=execve,unshare,mount,clone,openat -e signal=none \
+                -o "$STRACE_LOG" \
                 2>/dev/null &
             echo $! > /tmp/flow-strace.pid
         else
-            warn "  containerd 已被 ptrace (TracerPid=$tracer)，跳过 exec 监控"
+            warn "  containerd 已被 ptrace (TracerPid=$tracer)，跳过 syscall 监控"
             CONTAINERD_PID=""
         fi
     else
-        warn "  containerd 进程未找到，runc/CNI exec 验证将跳过"
+        warn "  containerd 进程未找到，syscall 监控将跳过"
     fi
 
     # 等待断点和 strace 就绪
@@ -1119,9 +1122,9 @@ STS_EOF
     [[ -z "$RUNC_BIN" ]] && RUNC_BIN=$(which runc 2>/dev/null || true)
 
     local runc_exec_found=false runc_sym_ok=false
-    if grep -q "runc" "$RUNC_EXEC_LOG" 2>/dev/null; then
+    if grep -q "runc" "$STRACE_LOG" 2>/dev/null; then
         runc_exec_found=true
-        echo "FLOW_RUNC_EXEC: $(grep 'runc' "$RUNC_EXEC_LOG" | head -3)" >> "$FLOW_LOG"
+        echo "FLOW_RUNC_EXEC: $(grep 'runc' "$STRACE_LOG" | head -3)" >> "$FLOW_LOG"
     fi
     if [[ -n "$RUNC_BIN" ]] && nm "$RUNC_BIN" 2>/dev/null | grep -qE "Container.*Start|libcontainer.*Start"; then
         runc_sym_ok=true
@@ -1135,9 +1138,9 @@ STS_EOF
     done
 
     # 检查 strace log 中是否有 CNI 插件被 exec（bridge, host-local, loopback 等）
-    if grep -qE '"bridge"|"host-local"|"loopback"|"flannel"' "$RUNC_EXEC_LOG" 2>/dev/null; then
+    if grep -qE '"bridge"|"host-local"|"loopback"|"flannel"' "$STRACE_LOG" 2>/dev/null; then
         cni_exec_found=true
-        echo "FLOW_CNI_EXEC: $(grep -E '"bridge"|"host-local"|"loopback"' "$RUNC_EXEC_LOG" | head -3)" >> "$FLOW_LOG"
+        echo "FLOW_CNI_EXEC: $(grep -E '"bridge"|"host-local"|"loopback"' "$STRACE_LOG" | head -3)" >> "$FLOW_LOG"
     fi
     # 备选：检查是否有新的 veth/cni 网络接口被创建
     if ip link show 2>/dev/null | grep -qE "^[0-9]+: veth|^[0-9]+: cni"; then
@@ -1153,29 +1156,29 @@ STS_EOF
         cni_sym_ok=true
     fi
 
-    # ── Phase 7: 验证内核层 — 找 Pod pause 进程，strace 其 syscall ──────────
-    info "  [4/4] 验证内核层（Pod 容器 syscall）..."
-    local kernel_ok=false
-    local PAUSE_PIDS
-    mapfile -t PAUSE_PIDS < <(pgrep -f "pause" 2>/dev/null || true)
-    for ppid in "${PAUSE_PIDS[@]}"; do
-        local tracer
-        tracer=$(awk '/TracerPid/{print $2}' /proc/"$ppid"/status 2>/dev/null || echo 1)
-        if [[ "$tracer" -eq 0 ]]; then
-            local klog
-            klog=$(timeout 3 strace -p "$ppid" \
-                -e trace=clone,unshare,mount,openat,read,write \
-                -f -ttt 2>&1 | head -15 || true)
-            local klines
-            klines=$(echo "$klog" | grep -c "^\[pid\]\|^[0-9]" || true)
-            if [[ $klines -gt 0 ]]; then
-                kernel_ok=true
-                echo "KERNEL_STRACE_PAUSE(pid=$ppid): $klog" >> "$FLOW_LOG"
-                ok "  kernel: strace pause PID $ppid → ${klines} syscalls captured"
-                break
-            fi
-        fi
-    done
+    # ── Phase 7: 从 strace 日志按步骤解析内核 syscall ────────────────────────
+    # Phase 2 的 containerd strace 已覆盖全流程，此处按各阶段分别提取验证
+    # 来源对照：
+    #   netns_linux.go:116 → unshare(CLONE_NEWNET)      → kernel __x64_sys_unshare
+    #   netns_linux.go:130 → mount(..., MS_BIND)         → kernel do_mount
+    #   overlay snapshot   → mount("overlay", ...)       → kernel do_mount
+    #   runc container fork→ clone(CLONE_NEWPID|...)     → kernel copy_process
+    #   cgroup assign      → openat(.../cgroup.procs)    → kernel cgroup_attach_task
+    local kernel_unshare_ok=false kernel_bind_ok=false \
+          kernel_overlay_ok=false kernel_clone_ok=false kernel_cgroup_ok=false
+
+    if [[ -n "$CONTAINERD_PID" ]]; then
+        grep -q "unshare(CLONE_NEWNET)" "$STRACE_LOG" 2>/dev/null \
+            && kernel_unshare_ok=true
+        grep -qE 'mount\(.*MS_BIND' "$STRACE_LOG" 2>/dev/null \
+            && kernel_bind_ok=true
+        grep -qE 'mount\(.*"overlay"' "$STRACE_LOG" 2>/dev/null \
+            && kernel_overlay_ok=true
+        grep -qE 'clone\(.*CLONE_NEWPID|clone\(.*CLONE_NEWNS' "$STRACE_LOG" 2>/dev/null \
+            && kernel_clone_ok=true
+        grep -qE 'openat\(.*cgroup\.procs' "$STRACE_LOG" 2>/dev/null \
+            && kernel_cgroup_ok=true
+    fi
 
     # ── Phase 8: 汇报全链路结果 ───────────────────────────────────────────
     echo ""
@@ -1203,7 +1206,22 @@ STS_EOF
         fi
     }
 
-    # 按流程顺序逐项报告
+    # 辅助：打印内核 syscall 验证结果
+    # report_kernel <sym> <ok_var_name> <desc> <source_loc>
+    report_kernel() {
+        local sym="$1" ok_var="$2" desc="$3" src="$4"
+        if [[ -z "$CONTAINERD_PID" ]]; then
+            printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s strace unavailable\n" "  kernel" "$sym"
+            flow_skip=$((flow_skip + 1))
+        elif ${!ok_var}; then
+            printf "  \033[1;32m✓KTRC\033[0m  %-14s %-28s %s (%s)\n" "  kernel" "$sym" "$desc" "$src"
+            flow_pass=$((flow_pass + 1))
+        else
+            printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s not seen in strace window\n" "  kernel" "$sym"
+        fi
+    }
+
+    # 按流程顺序逐项报告，内核 syscall 紧跟在触发它的用户态步骤之后
     report_component "apiserver"        2345 "apiserver"        "kube-apiserver"     "Store.Create (StatefulSet)"
     report_component "etcd"             2351 "etcd"             "etcd"               "EtcdServer.Put"
     report_component "ctrl_sts"         2346 "ctrl_sts"         "controller-manager" "syncStatefulSet → create Pod+PVC"
@@ -1213,13 +1231,21 @@ STS_EOF
     report_component "ctrl_pvc_bind"    2346 "ctrl_pvc_bind"    "controller-manager" "bindVolumeToClaim"
     report_component "scheduler"        2347 "scheduler"        "kube-scheduler"     "ScheduleOne"
     report_component "kubelet"          2348 "kubelet"          "kubelet"            "HandlePodAdditions"
-    # RunPodSandbox: 创建 pause 容器 + 建立 network namespace
-    report_component "cri_sandbox"      2350 "cri_sandbox"      "CRI/containerd"     "RunPodSandbox"
 
-    # CNI: 在 RunPodSandbox 内部被 containerd 调用，配置 pause 容器的网络
-    # 发生在 RunPodSandbox 返回之前，早于任何 app 容器的创建
+    # RunPodSandbox: 建 network namespace + 触发 CNI（sandbox_run.go:52）
+    # 内核在此步就已被调用——先于 pause 容器和 app 容器的任何 fork
+    report_component "cri_sandbox"      2350 "cri_sandbox"      "CRI/containerd"     "RunPodSandbox"
+    # sandbox_run.go:183 → netns_linux.go:116: unix.Unshare(CLONE_NEWNET) → __x64_sys_unshare
+    report_kernel "__x64_sys_unshare" "kernel_unshare_ok" \
+        "CLONE_NEWNET netns 创建" "netns_linux.go:116"
+    # sandbox_run.go:183 → netns_linux.go:130: unix.Mount(..., MS_BIND) → do_mount
+    report_kernel "do_mount(MS_BIND)" "kernel_bind_ok" \
+        "netns bind mount" "netns_linux.go:130"
+
+    # CNI: 在 RunPodSandbox 内部、CreateSandbox 之前被调用（sandbox_run.go:241）
+    # CNI bridge 插件通过 netlink RTM_NEWLINK 在内核创建 veth pair
     if $cni_exec_found; then
-        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s CNI exec captured (inside RunPodSandbox)\n" \
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s exec captured (sandbox_run.go:241)\n" \
             "CNI bridge" "cmdAdd"
         flow_pass=$((flow_pass + 1))
     elif $cni_netns_ok; then
@@ -1238,13 +1264,19 @@ STS_EOF
             "CNI bridge" "cmdAdd"
     fi
 
-    # CreateContainer + StartContainer: app 容器创建，RunPodSandbox 完成之后
+    # CreateContainer: 只创建容器元数据 + overlay rootfs snapshot（container_create.go:58）
+    # 无 runc 调用，但 overlay mount 会触发内核 do_mount
     report_component "cri_container"    2350 "cri_container"    "CRI/containerd"     "CreateContainer"
+    # container_create.go: containerd.WithNewSnapshot → mount("overlay",...) → do_mount
+    report_kernel "do_mount(overlay)" "kernel_overlay_ok" \
+        "overlay rootfs 挂载" "container_create.go"
+
+    # StartContainer: container_start.go:177 task.Start() → containerd-shim → runc
     report_component "cri_start"        2350 "cri_start"        "CRI/containerd"     "StartContainer"
 
-    # runc: StartContainer 内部通过 exec 调用，启动 app 容器进程
+    # runc: StartContainer 内部通过 exec 调用（container_start.go:177）
     if $runc_exec_found; then
-        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s runc exec captured (inside StartContainer)\n" \
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s exec captured (container_start.go:177)\n" \
             "runc" "Container.Start"
         flow_pass=$((flow_pass + 1))
     elif $runc_sym_ok; then
@@ -1258,16 +1290,12 @@ STS_EOF
         printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s runc not seen in strace window\n" \
             "runc" "Container.Start"
     fi
-
-    # kernel: runc 调用 clone() 创建容器进程，触发 copy_process / cgroup_attach_task
-    if $kernel_ok; then
-        printf "  \033[1;32m✓KTRC\033[0m  %-14s %-28s syscalls captured on pause container\n" \
-            "Linux kernel" "clone/mount/openat"
-        flow_pass=$((flow_pass + 1))
-    else
-        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s pause container not traceable\n" \
-            "Linux kernel" "clone/mount/openat"
-    fi
+    # runc/libcontainer: clone(CLONE_NEWPID|CLONE_NEWNS|...) → copy_process
+    report_kernel "copy_process" "kernel_clone_ok" \
+        "CLONE_NEWPID app 容器 fork" "runc/libcontainer"
+    # runc 完成后写 cgroup.procs → cgroup_attach_task（cgroup.c:2890）
+    report_kernel "cgroup_attach_task" "kernel_cgroup_ok" \
+        "cgroup.procs 写入" "cgroup.c:2890"
 
     echo ""
     info "  流程日志: $FLOW_LOG"
@@ -1278,7 +1306,7 @@ STS_EOF
 
     if [[ $flow_pass -gt 0 ]]; then
         ok "  全链路验证: ${flow_pass} 个组件确认，${flow_skip} 个跳过"
-        record "stateful pod flow" "✓ PASS" "${flow_pass}/15 components verified"
+        record "stateful pod flow" "✓ PASS" "${flow_pass}/19 components verified"
     elif [[ $flow_skip -gt 0 ]]; then
         warn "  ${flow_skip} 个组件未监听（运行 debug/all.sh 启动 dlv 服务）"
         record "stateful pod flow" "⚠ SKIP" "dlv ports not listening"
