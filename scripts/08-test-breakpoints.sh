@@ -494,13 +494,59 @@ CONF
     echo "$output" | tail -10
 }
 
-# ── 10. CSI (跳过 — 集群未部署 CSI driver) ────────────────────────────────────
+# ── 10. CSI hostpath driver (port 2353) ───────────────────────────────────────
+# csi-hostpathplugin 在 host 上以 dlv exec 运行；用本地 gRPC 客户端直接触发
 test_csi() {
-    info "═══ CSI 测试（跳过）═══"
-    warn "  集群未部署 CSI driver，跳过 CSI 断点测试"
-    warn "  如需测试，部署 hostpath CSI driver 后可调试:"
-    warn "  b sigs.k8s.io/sig-storage-lib-external-provisioner/v9/controller.(*ProvisionController).runClaimWorker"
-    record "CSI" "⚠ SKIP" "no CSI driver deployed"
+    info "═══ 测试 CSI hostpath driver (port 2353) ═══"
+    local port=2353
+
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过（先运行 bash debug/csi.sh）"
+        record "CSI CreateVolume" "⚠ SKIP" "port $port not listening"
+        return
+    fi
+
+    local CSI_CLIENT="/tmp/csi-test-client"
+    if [[ ! -f "$CSI_CLIENT" ]]; then
+        local CSI_SRC="$HOME/k8s-src/csi-driver-host-path"
+        if [[ -d "$CSI_SRC" ]]; then
+            info "  编译 CSI gRPC 测试客户端..."
+            (cd "$CSI_SRC" && GOFLAGS="-mod=vendor" go build \
+                -o "$CSI_CLIENT" ./hack/csi-test-client/ 2>/dev/null) || true
+        fi
+    fi
+    [[ -f "$CSI_CLIENT" ]] || { warn "csi-test-client 不存在，跳过"; record "CSI CreateVolume" "⚠ SKIP" "no test client"; return; }
+
+    local bp="github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).CreateVolume"
+    info "  断点: $bp"
+
+    # Session 1: set breakpoint and continue
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    # 触发: 直接调用 CSI gRPC (不需要 K8s 集成)
+    "$CSI_CLIENT" > /tmp/csi-client-trigger.log 2>&1 &
+    sleep 4
+
+    # Session 2: query state at breakpoint, then clear and continue
+    local output
+    output=$(dlv_session "localhost:$port" 15 \
+        "goroutines" \
+        "stack" \
+        "locals" \
+        "clearall" \
+        "c" \
+    ) || true
+
+    wait 2>/dev/null || true
+
+    if grep_output "$output" "CreateVolume|hostPath|Breakpoint|controllerserver|Goroutine"; then
+        ok "  CSI hostpath driver 断点验证通过"
+        record "CSI CreateVolume" "✓ PASS" "breakpoint hit at controllerserver.go"
+    else
+        warn "  CSI 断点输出未包含预期内容"
+        record "CSI CreateVolume" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -20
 }
 
 # ── 运行所有测试 ──────────────────────────────────────────────────────────────

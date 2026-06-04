@@ -1,0 +1,150 @@
+# CSI hostpath driver 部署（用于断点调试）
+#
+# 架构：
+#   hostpathplugin  ── 在 host 上以 dlv exec 运行（端口 2353）
+#   sidecars Pod    ── external-provisioner + node-driver-registrar
+#                      通过 hostPath 共享 CSI socket
+#
+# 前置：
+#   bash debug/csi.sh           # 启动 hostpathplugin（dlv 模式）
+#   kubectl apply -f deploy/csi-hostpath/csi-hostpath.yaml
+# 触发：
+#   kubectl apply -f deploy/csi-hostpath/test-pvc.yaml
+
+# ── RBAC ─────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: csi-hostpath-sa
+  namespace: kube-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpath-sa
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: csi-hostpath-provisioner
+  apiGroup: rbac.authorization.k8s.io
+
+# ── CSIDriver 对象（告知 K8s 该 driver 的能力）────────────────────────────────
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: hostpath.csi.k8s.io
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Persistent
+
+# ── StorageClass ──────────────────────────────────────────────────────────────
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath-sc
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+
+# ── Sidecars StatefulSet ──────────────────────────────────────────────────────
+# 可选：用于完整 K8s PVC 集成（需要 registry.k8s.io 可访问）
+# 断点测试不需要部署此 StatefulSet — 直接用 /tmp/csi-test-client 触发即可
+#
+# 包含 external-provisioner（触发 CreateVolume）和
+#       node-driver-registrar（向 kubelet 注册 CSI socket）
+# 两个 sidecar 都通过 hostPath 共享 /var/lib/kubelet/plugins/hostpath.csi.k8s.io/
+# hostpathplugin 本体在 host 上以 dlv exec 运行，创建该目录下的 csi.sock
+---
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: csi-hostpath-sidecars
+  namespace: kube-system
+spec:
+  serviceName: csi-hostpath
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-hostpath-sidecars
+  template:
+    metadata:
+      labels:
+        app: csi-hostpath-sidecars
+    spec:
+      serviceAccountName: csi-hostpath-sa
+      containers:
+
+      # external-provisioner: 监听 PVC 创建事件，调用 CSI CreateVolume
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+        args:
+          - --csi-address=/csi/csi.sock
+          - --v=5
+          - --leader-election=false
+          - --timeout=30s
+        volumeMounts:
+          - name: socket-dir
+            mountPath: /csi
+
+      # node-driver-registrar: 向 kubelet 注册 CSI socket 路径
+      - name: node-driver-registrar
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+        args:
+          - --v=5
+          - --csi-address=/csi/csi.sock
+          - --kubelet-registration-path=/var/lib/kubelet/plugins/hostpath.csi.k8s.io/csi.sock
+        volumeMounts:
+          - name: socket-dir
+            mountPath: /csi
+          - name: registration-dir
+            mountPath: /registration
+
+      volumes:
+        # 与 host 上 hostpathplugin 共享 CSI socket
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/hostpath.csi.k8s.io
+            type: DirectoryOrCreate
+        # kubelet 的 plugin 注册目录
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate

@@ -1,0 +1,29 @@
+# 触发 CSI CreateVolume + NodePublishVolume 断点的测试资源
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-debug-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Mi
+  storageClassName: csi-hostpath-sc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-debug-pod
+spec:
+  containers:
+    - name: test
+      image: registry.k8s.io/pause:3.10
+      volumeMounts:
+        - name: csi-vol
+          mountPath: /data
+  volumes:
+    - name: csi-vol
+      persistentVolumeClaim:
+        claimName: csi-debug-pvc
