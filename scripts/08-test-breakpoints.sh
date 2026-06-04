@@ -905,7 +905,13 @@ INIT_SCRIPT
 #   kernel(copy_process strace)
 test_stateful_pod_flow() {
     info "═══ 有状态 Pod 创建全链路断点测试 ═══"
-    info "  链路: apiserver→etcd→scheduler→kubelet→CRI→runc→CNI→CSI→kernel"
+    # 有状态 Pod（带 PVC，Immediate 绑定模式）完整流程：
+    #   apiserver → etcd → controller-manager(syncUnboundClaim)
+    #   → CSI(CreateVolume) → controller-manager(bindVolumeToClaim)
+    #   → scheduler → kubelet
+    #   → CRI(RunPodSandbox→CreateContainer→StartContainer)
+    #   → runc(Container.Start) → CNI(cmdAdd) → kernel
+    info "  链路: apiserver→etcd→controller-manager→CSI→scheduler→kubelet→CRI→runc→CNI→kernel"
 
     # 检查集群是否就绪
     if ! kubectl get nodes >/dev/null 2>&1; then
@@ -962,7 +968,19 @@ test_stateful_pod_flow() {
             "go.etcd.io/etcd/server/v3/etcdserver.(*EtcdServer).Put" \
             "etcd" 35
 
-    # kube-scheduler (2347): Pod 调度
+    # kube-controller-manager (2346): PVC 状态机
+    # syncUnboundClaim: 检测到未绑定 PVC，触发 CSI external-provisioner 动态配置
+    ss -tlnp 2>/dev/null | grep -q ":2346" && \
+        set_bp_watch 2346 \
+            "k8s.io/kubernetes/pkg/controller/volume/persistentvolume.(*PersistentVolumeController).syncUnboundClaim" \
+            "ctrl_pvc_unbound" 35
+    # bindVolumeToClaim: CSI 创建 PV 后，controller-manager 把 PV 绑定到 PVC
+    ss -tlnp 2>/dev/null | grep -q ":2346" && \
+        set_bp_watch 2346 \
+            "k8s.io/kubernetes/pkg/controller/volume/persistentvolume.(*PersistentVolumeController).bindVolumeToClaim" \
+            "ctrl_pvc_bind" 40
+
+    # kube-scheduler (2347): Pod 调度（等待 PVC Bound 后才能调度）
     ss -tlnp 2>/dev/null | grep -q ":2347" && \
         set_bp_watch 2347 \
             "k8s.io/kubernetes/pkg/scheduler.(*Scheduler).ScheduleOne" \
@@ -1171,14 +1189,17 @@ POD_EOF
         fi
     }
 
-    report_component "apiserver"     2345 "apiserver"      "kube-apiserver"   "Store.Create"
-    report_component "etcd"          2351 "etcd"           "etcd"             "EtcdServer.Put"
-    report_component "scheduler"     2347 "scheduler"      "kube-scheduler"   "ScheduleOne"
-    report_component "kubelet"       2348 "kubelet"        "kubelet"          "HandlePodAdditions"
-    report_component "csi"           2353 "csi"            "CSI hostpath"     "CreateVolume"
-    report_component "cri_sandbox"   2350 "cri_sandbox"    "CRI"              "RunPodSandbox"
-    report_component "cri_container" 2350 "cri_container"  "CRI"              "CreateContainer"
-    report_component "cri_start"     2350 "cri_start"      "CRI"              "StartContainer"
+    # 按流程顺序逐项报告
+    report_component "apiserver"        2345 "apiserver"        "kube-apiserver"     "Store.Create"
+    report_component "etcd"             2351 "etcd"             "etcd"               "EtcdServer.Put"
+    report_component "ctrl_pvc_unbound" 2346 "ctrl_pvc_unbound" "controller-manager" "syncUnboundClaim"
+    report_component "csi"              2353 "csi"              "CSI hostpath"       "CreateVolume"
+    report_component "ctrl_pvc_bind"    2346 "ctrl_pvc_bind"    "controller-manager" "bindVolumeToClaim"
+    report_component "scheduler"        2347 "scheduler"        "kube-scheduler"     "ScheduleOne"
+    report_component "kubelet"          2348 "kubelet"          "kubelet"            "HandlePodAdditions"
+    report_component "cri_sandbox"      2350 "cri_sandbox"      "CRI/containerd"     "RunPodSandbox"
+    report_component "cri_container"    2350 "cri_container"    "CRI/containerd"     "CreateContainer"
+    report_component "cri_start"        2350 "cri_start"        "CRI/containerd"     "StartContainer"
 
     # runc: exec 验证 + 符号
     if $runc_exec_found; then
@@ -1237,7 +1258,7 @@ POD_EOF
 
     if [[ $flow_pass -gt 0 ]]; then
         ok "  全链路验证: ${flow_pass} 个组件确认，${flow_skip} 个跳过"
-        record "stateful pod flow" "✓ PASS" "${flow_pass}/11 components verified"
+        record "stateful pod flow" "✓ PASS" "${flow_pass}/13 components verified"
     elif [[ $flow_skip -gt 0 ]]; then
         warn "  ${flow_skip} 个组件未监听（运行 debug/all.sh 启动 dlv 服务）"
         record "stateful pod flow" "⚠ SKIP" "dlv ports not listening"
