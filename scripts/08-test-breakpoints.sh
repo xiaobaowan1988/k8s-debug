@@ -913,9 +913,10 @@ test_stateful_pod_flow() {
     #   → CSI(CreateVolume)
     #   → controller-manager(bindVolumeToClaim) → PVC Bound
     #   → scheduler(ScheduleOne) → kubelet(HandlePodAdditions)
-    #   → CRI(RunPodSandbox→CreateContainer→StartContainer)
-    #   → runc(Container.Start) → CNI(cmdAdd) → kernel
-    info "  链路: apiserver→etcd→ctrl(syncStatefulSet)→apiserver→etcd→ctrl(syncUnboundClaim)→CSI→ctrl(bindVolumeToClaim)→scheduler→kubelet→CRI→runc→CNI→kernel"
+    #   → CRI(RunPodSandbox) → CNI(cmdAdd) → CRI(CreateContainer→StartContainer)
+    #   → runc(Container.Start) → kernel
+    # 注：CNI 在 RunPodSandbox 内部被调用（配置 pause 容器网络），早于 runc 启动 app 容器
+    info "  链路: apiserver→etcd→ctrl(syncStatefulSet)→apiserver→etcd→ctrl(syncUnboundClaim)→CSI→ctrl(bindVolumeToClaim)→scheduler→kubelet→CRI(RunPodSandbox)→CNI→CRI(CreateContainer→StartContainer)→runc→kernel"
 
     # 检查集群是否就绪
     if ! kubectl get nodes >/dev/null 2>&1; then
@@ -1212,30 +1213,13 @@ STS_EOF
     report_component "ctrl_pvc_bind"    2346 "ctrl_pvc_bind"    "controller-manager" "bindVolumeToClaim"
     report_component "scheduler"        2347 "scheduler"        "kube-scheduler"     "ScheduleOne"
     report_component "kubelet"          2348 "kubelet"          "kubelet"            "HandlePodAdditions"
+    # RunPodSandbox: 创建 pause 容器 + 建立 network namespace
     report_component "cri_sandbox"      2350 "cri_sandbox"      "CRI/containerd"     "RunPodSandbox"
-    report_component "cri_container"    2350 "cri_container"    "CRI/containerd"     "CreateContainer"
-    report_component "cri_start"        2350 "cri_start"        "CRI/containerd"     "StartContainer"
 
-    # runc: exec 验证 + 符号
-    if $runc_exec_found; then
-        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s runc exec captured by strace\n" \
-            "runc" "Container.Start"
-        flow_pass=$((flow_pass + 1))
-    elif $runc_sym_ok; then
-        printf "  \033[1;32m✓ SYM\033[0m  %-14s %-28s symbol verified (exec not captured)\n" \
-            "runc" "Container.Start"
-    elif [[ -z "$CONTAINERD_PID" ]]; then
-        printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s containerd not found for strace\n" \
-            "runc" "Container.Start"
-        flow_skip=$((flow_skip + 1))
-    else
-        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s runc not seen in strace window\n" \
-            "runc" "Container.Start"
-    fi
-
-    # CNI: exec 验证 + 网络接口 + 符号
+    # CNI: 在 RunPodSandbox 内部被 containerd 调用，配置 pause 容器的网络
+    # 发生在 RunPodSandbox 返回之前，早于任何 app 容器的创建
     if $cni_exec_found; then
-        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s CNI exec captured by strace\n" \
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s CNI exec captured (inside RunPodSandbox)\n" \
             "CNI bridge" "cmdAdd"
         flow_pass=$((flow_pass + 1))
     elif $cni_netns_ok; then
@@ -1254,7 +1238,28 @@ STS_EOF
             "CNI bridge" "cmdAdd"
     fi
 
-    # kernel: strace 结果
+    # CreateContainer + StartContainer: app 容器创建，RunPodSandbox 完成之后
+    report_component "cri_container"    2350 "cri_container"    "CRI/containerd"     "CreateContainer"
+    report_component "cri_start"        2350 "cri_start"        "CRI/containerd"     "StartContainer"
+
+    # runc: StartContainer 内部通过 exec 调用，启动 app 容器进程
+    if $runc_exec_found; then
+        printf "  \033[1;32m✓EXEC\033[0m  %-14s %-28s runc exec captured (inside StartContainer)\n" \
+            "runc" "Container.Start"
+        flow_pass=$((flow_pass + 1))
+    elif $runc_sym_ok; then
+        printf "  \033[1;32m✓ SYM\033[0m  %-14s %-28s symbol verified (exec not captured)\n" \
+            "runc" "Container.Start"
+    elif [[ -z "$CONTAINERD_PID" ]]; then
+        printf "  \033[1;33m⚠SKIP\033[0m  %-14s %-28s containerd not found for strace\n" \
+            "runc" "Container.Start"
+        flow_skip=$((flow_skip + 1))
+    else
+        printf "  \033[1;33m⚠PEND\033[0m  %-14s %-28s runc not seen in strace window\n" \
+            "runc" "Container.Start"
+    fi
+
+    # kernel: runc 调用 clone() 创建容器进程，触发 copy_process / cgroup_attach_task
     if $kernel_ok; then
         printf "  \033[1;32m✓KTRC\033[0m  %-14s %-28s syscalls captured on pause container\n" \
             "Linux kernel" "clone/mount/openat"
