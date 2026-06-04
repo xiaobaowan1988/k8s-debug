@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # 启动 QEMU ARM64 调试虚拟机
 #
-# 模式：
-#   普通启动（默认）:  bash scripts/mac/04-launch-qemu.sh
-#   内核调试模式:      bash scripts/mac/04-launch-qemu.sh --gdb
-#                        → QEMU 在 :1234 开启 GDB server，启动时暂停
-#                        → 另开终端: bash scripts/mac/05-kernel-debug.sh
-#   后台运行:          bash scripts/mac/04-launch-qemu.sh --bg
+# 两种启动模式（自动检测）：
+#
+#   UEFI 模式（默认，K8s 调试用，无需自编内核）：
+#     bash scripts/mac/04-launch-qemu.sh --bg
+#     → 需要 rootfs（02-prepare-rootfs.sh）
+#     → 使用 Homebrew QEMU 自带 edk2-aarch64-code.fd 固件
+#
+#   内核直接加载模式（内核/systemd 调试用）：
+#     bash scripts/mac/04-launch-qemu.sh --gdb --bg
+#     → 需要自编内核（01-build-kernel.sh）+ rootfs
+#     → 若 build/mac-debug/kernel/Image 存在则自动切换为此模式
+#     → nokaslr：GDB 断点地址固定（内核调试必须）
 #
 # VM 访问：
 #   SSH:  ssh -p 2222 -i build/mac-debug/debug-vm-key root@localhost
@@ -34,8 +40,28 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m  $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 die()   { echo -e "\033[1;31m[ERR ]\033[0m  $*"; exit 1; }
 
-[[ -f "$KERNEL" ]] || die "内核镜像不存在: $KERNEL（先运行 bash scripts/mac/01-build-kernel.sh）"
 [[ -f "$ROOTFS" ]] || die "根文件系统不存在: $ROOTFS（先运行 bash scripts/mac/02-prepare-rootfs.sh）"
+
+# ── 启动模式检测 ──────────────────────────────────────────────────────────────
+# 若自编内核存在则用内核直接加载模式（内核调试），否则用 UEFI 模式（K8s 调试）
+KERNEL_MODE=false
+[[ -f "$KERNEL" ]] && KERNEL_MODE=true
+
+# UEFI 固件（随 QEMU 安装，K8s 调试模式需要）
+UEFI_FIRMWARE=""
+for _p in \
+    /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+    /usr/local/share/qemu/edk2-aarch64-code.fd \
+    /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+    /usr/share/edk2/aarch64/QEMU_EFI.fd; do
+    [[ -f "$_p" ]] && { UEFI_FIRMWARE="$_p"; break; }
+done
+
+if ! $KERNEL_MODE && [[ -z "$UEFI_FIRMWARE" ]]; then
+    die "UEFI 固件未找到，且无自编内核
+  选项 A (K8s 调试): brew install qemu  → 自带 edk2-aarch64-code.fd
+  选项 B (内核调试): bash scripts/mac/01-build-kernel.sh"
+fi
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 GDB_MODE=false
@@ -65,12 +91,20 @@ QEMU_ARGS=(
     -cpu     host                   # 使用宿主 CPU（Cortex-A 系列）
     -m       "${MEM}M"
     -smp     "$CPUS"
+)
 
-    # ── 内核 ──────────────────────────────────────────────────────────────────
-    -kernel  "$KERNEL"
-    -append  "root=/dev/vda1 rw console=ttyAMA0 loglevel=8 nokaslr net.ifnames=0 biosdevname=0"
-    #         ^^^^^^  关闭地址随机化，GDB 断点地址固定（调试必须）
+if $KERNEL_MODE; then
+    # 内核直接加载模式：自编内核 + nokaslr（GDB 断点地址固定）
+    QEMU_ARGS+=(
+        -kernel "$KERNEL"
+        -append "root=/dev/vda1 rw console=ttyAMA0 loglevel=8 nokaslr net.ifnames=0 biosdevname=0"
+    )
+else
+    # UEFI 模式：Debian cloud image 自带内核，K8s 调试使用
+    QEMU_ARGS+=(-bios "$UEFI_FIRMWARE")
+fi
 
+QEMU_ARGS+=(
     # ── 存储 ──────────────────────────────────────────────────────────────────
     -drive   "if=virtio,format=qcow2,file=${ROOTFS}"
 )
@@ -104,7 +138,13 @@ fi
 echo ""
 info "══ 启动 QEMU ARM64 调试 VM ══"
 echo ""
-info "内核:    $KERNEL"
+if $KERNEL_MODE; then
+    info "模式:    内核直接加载（内核/systemd 调试）"
+    info "内核:    $KERNEL"
+else
+    info "模式:    UEFI 启动（K8s 组件调试）"
+    info "固件:    $UEFI_FIRMWARE"
+fi
 info "根文件系统: $ROOTFS"
 info "内存:    ${MEM}MB  CPU: $CPUS"
 info "SSH:     ssh -p $SSH_PORT root@localhost  (密码: debug123)"

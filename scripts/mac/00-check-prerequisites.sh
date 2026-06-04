@@ -70,6 +70,16 @@ fi
 # qemu-img（通常随 QEMU 一起安装）
 command -v qemu-img &>/dev/null && ok "qemu-img ✓" || { fail "qemu-img"; warn "随 QEMU 一起安装"; }
 
+# UEFI 固件（K8s 调试模式，UEFI 启动需要；随 QEMU 一起安装）
+UEFI_FW=""
+for _p in \
+    /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+    /usr/local/share/qemu/edk2-aarch64-code.fd \
+    /usr/share/qemu-efi-aarch64/QEMU_EFI.fd; do
+    [[ -f "$_p" ]] && { UEFI_FW="$_p"; break; }
+done
+[[ -n "$UEFI_FW" ]] && ok "UEFI 固件 $UEFI_FW ✓" || warn "未找到 UEFI 固件（K8s 调试需要，brew install qemu 自带）"
+
 # GDB（远程调试不需要代码签名）
 if command -v gdb &>/dev/null; then
     ok "gdb $(gdb --version | head -1 | grep -oP '\d+\.\d+') ✓"
