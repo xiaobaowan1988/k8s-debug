@@ -85,11 +85,29 @@ if [[ -d "$CNI_OUT" ]] && ls "$CNI_OUT"/* &>/dev/null; then
     ok "  CNI 插件 → /opt/cni/bin/"
 fi
 
-# ── 触发控制平面重启（touch 静态 Pod manifests）──────────────────────────────
+# ── 重启 kubelet（host 进程，替换二进制后需重启）──────────────────────────────
+if [[ -f "$K8S_BUILD/kubelet" ]]; then
+    info "重启 kubelet（使用 debug 版二进制）..."
+    KUBELET_PID=$(pgrep -x kubelet | head -1 || true)
+    if [[ -n "$KUBELET_PID" ]]; then
+        # 读取当前启动命令
+        KUBELET_CMD=$(cat /proc/"$KUBELET_PID"/cmdline | tr '\0' ' ' | sed 's/ $//')
+        kill "$KUBELET_PID"
+        sleep 2
+        # 用相同参数重启
+        eval "nohup $KUBELET_CMD > /var/log/kubelet.log 2>&1 &"
+        disown
+        sleep 3
+        NEW_PID=$(pgrep -x kubelet | head -1 || true)
+        [[ -n "$NEW_PID" ]] && ok "  kubelet 已重启 PID=$NEW_PID" || warn "  kubelet 重启失败，请手动检查"
+    fi
+fi
+
+# ── 触发控制平面静态 Pod 重建（通过 touch manifests）────────────────────────
 if [[ -d /etc/kubernetes/manifests ]]; then
     info "触发控制平面静态 Pod 重建..."
     touch /etc/kubernetes/manifests/*.yaml 2>/dev/null || true
-    ok "  静态 Pod manifests 已 touch，kubelet 将自动重建"
+    ok "  静态 Pod manifests 已 touch，kubelet 将自动重建容器"
 fi
 
 echo ""
@@ -102,4 +120,4 @@ echo "  kubelet, kube-proxy"
 [[ -f "$RUNC_BIN" ]] && echo "  runc"
 [[ -d "$CNI_OUT" ]] && echo "  CNI: $(ls "$CNI_OUT" 2>/dev/null | tr '\n' ' ')"
 echo ""
-echo "下一步: make debug-all"
+echo "下一步: bash scripts/06-setup-debug-manifests.sh && make debug-all"

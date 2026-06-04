@@ -20,6 +20,7 @@ GOFLAGS_DEBUG  := -gcflags=all="-N -l"
 
 .PHONY: all setup clone build-k8s build-containerd build-runc build-cni \
         cluster-create cluster-delete inject-binaries \
+        setup-debug-manifests restore-manifests test-breakpoints \
         debug-all debug-apiserver debug-controller debug-scheduler \
         debug-kubelet debug-proxy debug-containerd \
         clean clean-src help
@@ -97,6 +98,17 @@ inject-binaries:
 
 inject-runc-patched:
 	@bash scripts/05-inject-runc-patched.sh $(RUNTIME_BUILD)
+
+## ── 调试 manifest 管理 ────────────────────────────────────────────────────────
+setup-debug-manifests:
+	@bash scripts/06-setup-debug-manifests.sh
+
+restore-manifests:
+	@bash scripts/06-setup-debug-manifests.sh restore
+
+## ── 断点测试 ──────────────────────────────────────────────────────────────────
+test-breakpoints:
+	@bash scripts/08-test-breakpoints.sh
 
 ## ── 调试入口 ──────────────────────────────────────────────────────────────────
 debug-all:
