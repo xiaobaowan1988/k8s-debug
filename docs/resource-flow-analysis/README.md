@@ -37,9 +37,9 @@
 ### 阶段 2：存储链路
 | 文档 | 资源 | 状态 |
 |------|------|------|
-| `07-pvc-dynamic.md` | PVC + StorageClass（动态配置） | ⬜ |
-| `08-pv-static.md` | PV + VolumeAttachment（静态 + CSI attach） | ⬜ |
-| `09-csi-objects.md` | CSIDriver, CSINode, CSIStorageCapacity | ⬜ |
+| `07-pvc-dynamic.md` | PVC + StorageClass（动态配置） | ✅ |
+| `08-pv-static.md` | PV + VolumeAttachment（静态 + CSI attach） | ✅ |
+| `09-csi-objects.md` | CSIDriver, CSINode, CSIStorageCapacity | ✅ |
 
 ### 阶段 3：网络链路
 | 文档 | 资源 | 状态 |
