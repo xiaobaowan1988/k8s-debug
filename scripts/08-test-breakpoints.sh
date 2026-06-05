@@ -398,8 +398,8 @@ test_runc() {
     local sym_check
     sym_check=$(nm "$RUNC_BIN" 2>/dev/null | grep -c "Container.*Start" || echo "0")
     if [[ "$sym_check" -gt 0 ]]; then
-        ok "  runc 调试符号验证通过（Container.Start 符号存在）"
-        record "runc Container.Start" "✓ PASS" "symbols verified: ${sym_check} match(es)"
+        warn "  runc 符号存在但断点未命中（runc 由 containerd exec，无法预先 attach）"
+        record "runc Container.Start" "⚠ WARN" "symbols verified: ${sym_check} match(es), no runtime hit (exec'd by containerd)"
     else
         warn "  runc 调试符号未找到"
         record "runc Container.Start" "⚠ WARN" "symbol not found in binary"
@@ -481,11 +481,11 @@ CONF
     ip link del cni-test0 2>/dev/null || true
 
     if grep_output "$output" "Breakpoint [0-9]+ set|bp-set-ok|cmdAdd"; then
-        ok "  CNI bridge 断点验证通过（breakpoint resolved to symbol）"
-        record "CNI bridge cmdAdd" "✓ PASS" "breakpoint resolved"
+        warn "  CNI bridge 符号可解析，断点未命中（CNI 由 containerd exec，无法预先 attach）"
+        record "CNI bridge cmdAdd" "⚠ WARN" "breakpoint resolved, no runtime hit (exec'd by containerd)"
     elif [[ "$sym_check" -gt 0 ]]; then
-        ok "  CNI bridge 符号已验证（nm 确认 ${sym_check} 个 cmdAdd 符号）"
-        record "CNI bridge cmdAdd" "✓ PASS" "nm symbols: ${sym_check}"
+        warn "  CNI bridge 符号存在但断点未命中（CNI 由 containerd exec，无法预先 attach）"
+        record "CNI bridge cmdAdd" "⚠ WARN" "nm symbols: ${sym_check}, no runtime hit"
     else
         warn "  CNI bridge 断点验证失败"
         record "CNI bridge cmdAdd" "✗ FAIL" "symbol resolution failed"
@@ -2631,8 +2631,8 @@ test_webhook() {
     ) || true
 
     if grep_output "$out_mut" "mutatingDispatcher|Dispatch|Breakpoint"; then
-        ok "  mutatingDispatcher 符号可解析"
-        record "webhook mutatingDispatcher.Dispatch" "✓ PASS" "symbol resolved"
+        warn "  mutatingDispatcher 符号可解析，断点未命中（无 MutatingWebhookConfiguration）"
+        record "webhook mutatingDispatcher.Dispatch" "⚠ WARN" "symbol resolved, no runtime hit (no webhook config)"
     else
         warn "  mutatingDispatcher 符号验证失败"
         record "webhook mutatingDispatcher.Dispatch" "⚠ WARN" "symbol not found"
@@ -2649,8 +2649,8 @@ test_webhook() {
     ) || true
 
     if grep_output "$out_val" "validatingDispatcher|Dispatch|Breakpoint"; then
-        ok "  validatingDispatcher 符号可解析"
-        record "webhook validatingDispatcher.Dispatch" "✓ PASS" "symbol resolved"
+        warn "  validatingDispatcher 符号可解析，断点未命中（无 ValidatingWebhookConfiguration）"
+        record "webhook validatingDispatcher.Dispatch" "⚠ WARN" "symbol resolved, no runtime hit (no webhook config)"
     else
         warn "  validatingDispatcher 符号验证失败"
         record "webhook validatingDispatcher.Dispatch" "⚠ WARN" "symbol not found"
