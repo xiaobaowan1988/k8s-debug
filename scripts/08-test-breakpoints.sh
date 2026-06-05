@@ -609,6 +609,14 @@ sock.close()
 #     → kube-proxy OnServiceAdd        ← 检知新 Service
 #     → kube-proxy OnEndpointSliceAdd  ← 检知新 EndpointSlice
 #     → kube-proxy syncProxyRules      ← 写入 iptables 规则
+#
+# iptables 规则两种形态（由 syncProxyRules 写入）：
+#   无 Endpoint：
+#     filter/KUBE-SERVICES -d <clusterIP>/32 ... -j REJECT  （has no endpoints）
+#   有 Endpoint（Pod 存在）：
+#     nat/KUBE-SERVICES -d <clusterIP>/32 ... -j KUBE-SVC-{hash}
+#     nat/KUBE-SVC-{hash} -j KUBE-SEP-{hash}               （随机负载均衡）
+#     nat/KUBE-SEP-{hash} -j DNAT --to-destination podIP:port
 test_kube_proxy() {
     info "═══ 测试 kube-proxy Service 完整链路 (port 2349) ═══"
     local port=2349
@@ -634,6 +642,8 @@ test_kube_proxy() {
         record "kube-proxy OnServiceAdd" "⚠ SKIP" "port $port not listening"
         record "kube-proxy OnEndpointSliceAdd" "⚠ SKIP" "port $port not listening"
         record "kube-proxy syncProxyRules" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy iptables(no-ep REJECT)" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy iptables(with-ep DNAT)" "⚠ SKIP" "port $port not listening"
         return
     fi
 
@@ -713,8 +723,6 @@ test_kube_proxy() {
         "c" \
     ) || true
 
-    kubectl delete service "${svc_name}-2" --ignore-not-found 2>/dev/null || true
-
     if grep_output "$out_sync" "syncProxyRules|Proxier|Goroutine|goroutine|serviceMap|endpointsMap"; then
         ok "  syncProxyRules 断点命中（iptables 写入路径已验证）"
         record "kube-proxy syncProxyRules" "✓ PASS" "breakpoint hit"
@@ -722,7 +730,112 @@ test_kube_proxy() {
         warn "  syncProxyRules 未命中"
         record "kube-proxy syncProxyRules" "⚠ WARN" "check output"
     fi
-    echo "$out_sync" | tail -20
+    echo "$out_sync" | tail -10
+
+    # ── iptables 验证 A: 无 Endpoint → filter/KUBE-SERVICES REJECT ─────────
+    info "  iptables 验证 A: 无 Endpoint（应生成 REJECT 规则）"
+    local clusterip_2
+    clusterip_2=$(kubectl get svc "${svc_name}-2" \
+        -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+
+    if [[ -n "$clusterip_2" ]]; then
+        local reject_rule
+        reject_rule=$(iptables-save -t filter 2>/dev/null \
+            | grep "$clusterip_2" || true)
+        if echo "$reject_rule" | grep -q "REJECT"; then
+            ok "  无 Endpoint REJECT 规则存在: $reject_rule"
+            record "kube-proxy iptables(no-ep REJECT)" "✓ PASS" \
+                "filter KUBE-SERVICES -d ${clusterip_2}/32 -j REJECT"
+        else
+            warn "  未找到 REJECT 规则（clusterIP=${clusterip_2}）"
+            record "kube-proxy iptables(no-ep REJECT)" "⚠ WARN" \
+                "REJECT rule not found for ${clusterip_2}"
+        fi
+    else
+        warn "  无法获取 clusterIP，跳过 iptables 验证 A"
+        record "kube-proxy iptables(no-ep REJECT)" "⚠ WARN" "clusterIP not found"
+    fi
+
+    kubectl delete service "${svc_name}-2" --ignore-not-found 2>/dev/null || true
+
+    # ── iptables 验证 B: 有 Endpoint → nat KUBE-SVC + KUBE-SEP + DNAT ──────
+    info "  iptables 验证 B: 有 Endpoint（应生成 KUBE-SVC + KUBE-SEP + DNAT）"
+
+    # 创建 Pod + Service，selector 匹配
+    local pod_name="proxy-ep-${ts}"
+    kubectl run "$pod_name" \
+        --image=registry.k8s.io/pause:3.10 \
+        --labels="app=proxy-ep-${ts}" \
+        --restart=Never 2>/dev/null || true
+
+    local svc_ep="${svc_name}-ep"
+    kubectl create service clusterip "$svc_ep" \
+        --tcp=9090:9090 2>/dev/null || true
+    # patch selector to match the pod
+    kubectl patch service "$svc_ep" \
+        -p "{\"spec\":{\"selector\":{\"app\":\"proxy-ep-${ts}\"}}}" 2>/dev/null || true
+
+    # 等待 Pod Running + EndpointSlice 创建
+    info "  等待 Pod Running 和 EndpointSlice..."
+    local waited=0
+    while [[ $waited -lt 30 ]]; do
+        local ep_count
+        ep_count=$(kubectl get endpointslices -l "kubernetes.io/service-name=${svc_ep}" \
+            -o jsonpath='{.items[0].endpoints[0].addresses[0]}' 2>/dev/null || true)
+        [[ -n "$ep_count" ]] && break
+        sleep 2; waited=$((waited+2))
+    done
+
+    # 等 kube-proxy syncProxyRules
+    sleep 5
+    # Resume kube-proxy in case frozen at breakpoint
+    echo '{"method":"RPCServer.Command","params":[{"name":"continue"}],"id":1}' \
+        | timeout 3 nc localhost "$port" > /dev/null 2>&1 || true
+    sleep 3
+
+    local clusterip_ep
+    clusterip_ep=$(kubectl get svc "$svc_ep" \
+        -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+
+    if [[ -n "$clusterip_ep" ]]; then
+        # nat 表中应有 KUBE-SVC-* 和 KUBE-SEP-*
+        local nat_svc nat_sep nat_dnat
+        nat_svc=$(iptables-save -t nat 2>/dev/null \
+            | grep "$clusterip_ep" || true)
+        nat_sep=$(iptables-save -t nat 2>/dev/null \
+            | grep "KUBE-SEP" | grep -v "kubernetes:https" || true)
+        nat_dnat=$(iptables-save -t nat 2>/dev/null \
+            | grep "DNAT" | grep -v "kubernetes:https" || true)
+
+        info "  nat KUBE-SERVICES 条目:"
+        echo "$nat_svc" | sed 's/^/    /'
+        info "  nat KUBE-SEP 链（非 kubernetes svc）:"
+        echo "$nat_sep" | head -6 | sed 's/^/    /'
+        info "  nat DNAT 规则（非 kubernetes svc）:"
+        echo "$nat_dnat" | head -6 | sed 's/^/    /'
+
+        local pass_count=0
+        echo "$nat_svc" | grep -q "KUBE-SVC"  && pass_count=$((pass_count+1))
+        echo "$nat_sep" | grep -q "KUBE-SEP"  && pass_count=$((pass_count+1))
+        echo "$nat_dnat" | grep -q "DNAT"      && pass_count=$((pass_count+1))
+
+        if [[ $pass_count -ge 2 ]]; then
+            ok "  有 Endpoint DNAT 链验证通过（${pass_count}/3）"
+            record "kube-proxy iptables(with-ep DNAT)" "✓ PASS" \
+                "nat: KUBE-SERVICES→KUBE-SVC→KUBE-SEP→DNAT (${pass_count}/3 checks)"
+        else
+            warn "  DNAT 链不完整（${pass_count}/3，可能 Pod 未就绪）"
+            record "kube-proxy iptables(with-ep DNAT)" "⚠ WARN" \
+                "only ${pass_count}/3 checks passed (pod may not be ready yet)"
+        fi
+    else
+        warn "  无法获取 clusterIP，跳过 iptables 验证 B"
+        record "kube-proxy iptables(with-ep DNAT)" "⚠ WARN" "clusterIP not found"
+    fi
+
+    # 清理
+    kubectl delete pod "$pod_name" --ignore-not-found 2>/dev/null || true
+    kubectl delete service "$svc_ep" --ignore-not-found 2>/dev/null || true
 }
 
 # ── 13. 内核路径（strace 系统调用追踪）────────────────────────────────────────
