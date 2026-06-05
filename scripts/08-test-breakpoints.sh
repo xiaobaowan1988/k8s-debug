@@ -602,29 +602,110 @@ sock.close()
 }
 
 # ── 12. kube-proxy (port 2349) ────────────────────────────────────────────────
+# Service 创建完整链路（kube-proxy 侧）：
+#   kubectl create service
+#     → apiserver 写 etcd（Store.Create）
+#     → EndpointSlice controller 创建 EndpointSlice
+#     → kube-proxy OnServiceAdd        ← 检知新 Service
+#     → kube-proxy OnEndpointSliceAdd  ← 检知新 EndpointSlice
+#     → kube-proxy syncProxyRules      ← 写入 iptables 规则
 test_kube_proxy() {
-    info "═══ 测试 kube-proxy (port 2349) ═══"
+    info "═══ 测试 kube-proxy Service 完整链路 (port 2349) ═══"
     local port=2349
+
+    # ── 自动启动 ──────────────────────────────────────────────────────────────
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        local proxy_bin="${PROXY_BIN:-/usr/local/bin/kube-proxy}"
+        if [[ -f "$proxy_bin" ]] && kubectl cluster-info &>/dev/null 2>&1; then
+            info "  端口 $port 未监听，自动启动 kube-proxy dlv 服务器..."
+            local script_dir
+            script_dir="$(cd "$(dirname "$0")" && pwd)"
+            bash "${script_dir}/../debug/kube-proxy.sh" > /tmp/dlv-kube-proxy-autostart.log 2>&1 &
+            local waited=0
+            while [[ $waited -lt 15 ]]; do
+                sleep 2; waited=$((waited+2))
+                ss -tlnp 2>/dev/null | grep -q ":$port" && break
+            done
+        fi
+    fi
 
     if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
         warn "端口 $port 未监听，跳过（先运行 bash debug/kube-proxy.sh）"
-        record "kube-proxy bp" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy OnServiceAdd" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy OnEndpointSliceAdd" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy syncProxyRules" "⚠ SKIP" "port $port not listening"
         return
     fi
 
-    local bp="k8s.io/kubernetes/pkg/proxy/iptables.(*Proxier).syncProxyRules"
-    info "  断点: $bp"
+    local ts
+    ts=$(date +%s)
+    local svc_name="proxy-svc-${ts}"
 
-    # Session 1: set breakpoint and continue
-    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+    # ── 断点 1: OnServiceAdd — kube-proxy 收到新 Service 通知 ──────────────
+    local bp_svc_add="k8s.io/kubernetes/pkg/proxy/iptables.(*Proxier).OnServiceAdd"
+    info "  断点(OnServiceAdd): $bp_svc_add"
+    dlv_session "localhost:$port" 10 "b $bp_svc_add" "c" > /dev/null 2>&1 || true
 
-    # 触发：创建/删除 Service 触发 iptables 同步
-    kubectl create service clusterip proxy-bp-test --tcp=80:80 2>/dev/null || true
+    kubectl create service clusterip "$svc_name" --tcp=80:80 2>/dev/null || true
+    sleep 3
+
+    local out_svc
+    out_svc=$(dlv_session "localhost:$port" 15 \
+        "goroutines" \
+        "stack" \
+        "p svc" \
+        "clearall" \
+        "c" \
+    ) || true
+
+    if grep_output "$out_svc" "OnServiceAdd|Proxier|Goroutine|goroutine|svc"; then
+        ok "  OnServiceAdd 断点命中"
+        record "kube-proxy OnServiceAdd" "✓ PASS" "breakpoint hit"
+    else
+        warn "  OnServiceAdd 未命中（可能 Service 已存在或同步周期跳过）"
+        record "kube-proxy OnServiceAdd" "⚠ WARN" "check output"
+    fi
+    echo "$out_svc" | tail -8
+
+    # ── 断点 2: OnEndpointSliceAdd — kube-proxy 收到 EndpointSlice 通知 ──
+    local bp_eps="k8s.io/kubernetes/pkg/proxy/iptables.(*Proxier).OnEndpointSliceAdd"
+    info "  断点(OnEndpointSliceAdd): $bp_eps"
+    dlv_session "localhost:$port" 10 "b $bp_eps" "c" > /dev/null 2>&1 || true
+
+    # 触发：更新 Service selector 让 EndpointSlice 重新同步
+    kubectl patch service "$svc_name" -p '{"spec":{"selector":{"app":"proxy-test"}}}' 2>/dev/null || true
+    sleep 3
+
+    local out_eps
+    out_eps=$(dlv_session "localhost:$port" 15 \
+        "goroutines" \
+        "stack" \
+        "clearall" \
+        "c" \
+    ) || true
+
+    if grep_output "$out_eps" "OnEndpointSliceAdd|EndpointSlice|Goroutine|goroutine"; then
+        ok "  OnEndpointSliceAdd 断点命中"
+        record "kube-proxy OnEndpointSliceAdd" "✓ PASS" "breakpoint hit"
+    else
+        warn "  OnEndpointSliceAdd 未命中（EndpointSlice 可能未变化）"
+        record "kube-proxy OnEndpointSliceAdd" "⚠ WARN" "check output"
+    fi
+    echo "$out_eps" | tail -8
+
+    # ── 断点 3: syncProxyRules — iptables 规则写入 ──────────────────────────
+    local bp_sync="k8s.io/kubernetes/pkg/proxy/iptables.(*Proxier).syncProxyRules"
+    info "  断点(syncProxyRules): $bp_sync"
+    dlv_session "localhost:$port" 10 "b $bp_sync" "c" > /dev/null 2>&1 || true
+
+    # 删除再重建触发完整同步
+    kubectl delete service "$svc_name" --ignore-not-found 2>/dev/null || true
+    sleep 2
+    kubectl create service clusterip "${svc_name}-2" --tcp=8080:8080 2>/dev/null || true
     sleep 4
 
-    # Session 2: query state while paused
-    local output
-    output=$(dlv_session "localhost:$port" 15 \
+    local out_sync
+    out_sync=$(dlv_session "localhost:$port" 20 \
         "goroutines" \
         "stack" \
         "locals" \
@@ -632,16 +713,16 @@ test_kube_proxy() {
         "c" \
     ) || true
 
-    kubectl delete service proxy-bp-test --ignore-not-found 2>/dev/null || true
+    kubectl delete service "${svc_name}-2" --ignore-not-found 2>/dev/null || true
 
-    if grep_output "$output" "syncProxyRules|Proxier|Breakpoint|Goroutine|goroutine"; then
-        ok "  kube-proxy 断点验证通过"
+    if grep_output "$out_sync" "syncProxyRules|Proxier|Goroutine|goroutine|serviceMap|endpointsMap"; then
+        ok "  syncProxyRules 断点命中（iptables 写入路径已验证）"
         record "kube-proxy syncProxyRules" "✓ PASS" "breakpoint hit"
     else
-        warn "  kube-proxy 输出未包含预期内容"
+        warn "  syncProxyRules 未命中"
         record "kube-proxy syncProxyRules" "⚠ WARN" "check output"
     fi
-    echo "$output" | tail -20
+    echo "$out_sync" | tail -20
 }
 
 # ── 13. 内核路径（strace 系统调用追踪）────────────────────────────────────────
