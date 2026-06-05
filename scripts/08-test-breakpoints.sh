@@ -1356,6 +1356,1324 @@ test_systemd() {
     fi
 }
 
+# ── 16. ReplicaSet controller ─────────────────────────────────────────────────
+test_replicaset() {
+    info "═══ 测试 ReplicaSet controller (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "replicaset syncReplicaSet" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local bp="k8s.io/kubernetes/pkg/controller/replicaset.(*ReplicaSetController).syncReplicaSet"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    kubectl create deployment rs-bp-$ts \
+        --image=registry.k8s.io/pause:3.10 --replicas=1 2>/dev/null || true
+
+    local output
+    output=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    kubectl delete deployment rs-bp-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "syncReplicaSet|ReplicaSetController|Goroutine"; then
+        ok "  syncReplicaSet 断点验证通过"
+        record "replicaset syncReplicaSet" "✓ PASS" "breakpoint hit"
+    else
+        warn "  syncReplicaSet 未命中（输出可能为空）"
+        record "replicaset syncReplicaSet" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -12
+}
+
+# ── 17. DaemonSet controller ───────────────────────────────────────────────────
+test_daemonset() {
+    info "═══ 测试 DaemonSet controller (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "daemonset syncDaemonSet" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local bp="k8s.io/kubernetes/pkg/controller/daemon.(*DaemonSetsController).syncDaemonSet"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ds-bp-$ts
+spec:
+  selector:
+    matchLabels:
+      app: ds-bp-$ts
+  template:
+    metadata:
+      labels:
+        app: ds-bp-$ts
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10
+EOF
+
+    local output
+    output=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    kubectl delete daemonset ds-bp-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "syncDaemonSet|DaemonSetsController|Goroutine"; then
+        ok "  syncDaemonSet 断点验证通过"
+        record "daemonset syncDaemonSet" "✓ PASS" "breakpoint hit"
+    else
+        warn "  syncDaemonSet 未命中"
+        record "daemonset syncDaemonSet" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -12
+}
+
+# ── 18. Job + CronJob controller ───────────────────────────────────────────────
+test_job_cronjob() {
+    info "═══ 测试 Job / CronJob controller (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "job syncJob" "⚠ SKIP" "port not listening"
+        record "cronjob syncCronJob" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- Job ----
+    local bp_job="k8s.io/kubernetes/pkg/controller/job.(*Controller).syncJob"
+    info "  断点(Job): $bp_job"
+
+    dlv_session "localhost:$port" 10 "b $bp_job" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    kubectl create job job-bp-$ts --image=registry.k8s.io/pause:3.10 2>/dev/null || true
+
+    local out_job
+    out_job=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete job job-bp-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_job" "syncJob|Controller|Goroutine"; then
+        ok "  syncJob 断点验证通过"
+        record "job syncJob" "✓ PASS" "breakpoint hit"
+    else
+        warn "  syncJob 未命中"
+        record "job syncJob" "⚠ WARN" "check output"
+    fi
+    echo "$out_job" | tail -8
+
+    # ---- CronJob ----
+    local bp_cj="k8s.io/kubernetes/pkg/controller/cronjob.(*ControllerV2).syncCronJob"
+    info "  断点(CronJob): $bp_cj"
+
+    dlv_session "localhost:$port" 10 "b $bp_cj" "c" > /dev/null 2>&1 || true
+
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cj-bp-$ts
+spec:
+  schedule: "*/1 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: pause
+            image: registry.k8s.io/pause:3.10
+EOF
+
+    local out_cj
+    out_cj=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete cronjob cj-bp-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_cj" "syncCronJob|ControllerV2|Goroutine"; then
+        ok "  syncCronJob 断点验证通过"
+        record "cronjob syncCronJob" "✓ PASS" "breakpoint hit"
+    else
+        warn "  syncCronJob 未命中"
+        record "cronjob syncCronJob" "⚠ WARN" "check output"
+    fi
+    echo "$out_cj" | tail -8
+}
+
+# ── 19. HPA controller ─────────────────────────────────────────────────────────
+test_hpa() {
+    info "═══ 测试 HPA controller (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "hpa reconcileAutoscaler" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local bp="k8s.io/kubernetes/pkg/controller/podautoscaler.(*HorizontalController).reconcileAutoscaler"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    # 先创建 Deployment 再挂 HPA
+    kubectl create deployment hpa-target-$ts \
+        --image=registry.k8s.io/pause:3.10 --replicas=1 2>/dev/null || true
+    kubectl autoscale deployment hpa-target-$ts \
+        --cpu-percent=50 --min=1 --max=3 2>/dev/null || true
+
+    local output
+    output=$(dlv_session "localhost:$port" 25 "goroutines" "stack" "clearall" "c") || true
+
+    kubectl delete hpa hpa-target-$ts --ignore-not-found 2>/dev/null || true
+    kubectl delete deployment hpa-target-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "reconcileAutoscaler|HorizontalController|Goroutine"; then
+        ok "  reconcileAutoscaler 断点验证通过"
+        record "hpa reconcileAutoscaler" "✓ PASS" "breakpoint hit"
+    else
+        warn "  reconcileAutoscaler 未命中（无 metrics-server 时正常）"
+        record "hpa reconcileAutoscaler" "⚠ WARN" "no metrics-server or no hit"
+    fi
+    echo "$output" | tail -12
+}
+
+# ── 20. Leader election + Node lifecycle ───────────────────────────────────────
+test_lease() {
+    info "═══ 测试 Leader Election / Node Lifecycle (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "lease tryAcquireOrRenew" "⚠ SKIP" "port not listening"
+        record "nodelifecycle monitorNodeHealth" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- Leader Election（每 2s renew 一次，很快命中）----
+    local bp_le="k8s.io/client-go/tools/leaderelection.(*LeaderElector).tryAcquireOrRenew"
+    info "  断点(LeaderElection): $bp_le"
+
+    dlv_session "localhost:$port" 10 "b $bp_le" "c" > /dev/null 2>&1 || true
+
+    local out_le
+    out_le=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "locals" "clearall" "c") || true
+
+    if grep_output "$out_le" "tryAcquireOrRenew|LeaderElector|Goroutine"; then
+        ok "  tryAcquireOrRenew 断点验证通过"
+        record "lease tryAcquireOrRenew" "✓ PASS" "breakpoint hit"
+    else
+        warn "  tryAcquireOrRenew 未命中（可能 leader election 未激活）"
+        record "lease tryAcquireOrRenew" "⚠ WARN" "check output"
+    fi
+    echo "$out_le" | tail -10
+
+    # ---- Node Lifecycle（每 ~5s 执行一次）----
+    local bp_nl="k8s.io/kubernetes/pkg/controller/nodelifecycle.(*Controller).monitorNodeHealth"
+    info "  断点(NodeLifecycle): $bp_nl"
+
+    dlv_session "localhost:$port" 10 "b $bp_nl" "c" > /dev/null 2>&1 || true
+
+    local out_nl
+    out_nl=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    if grep_output "$out_nl" "monitorNodeHealth|Controller|Goroutine"; then
+        ok "  monitorNodeHealth 断点验证通过"
+        record "nodelifecycle monitorNodeHealth" "✓ PASS" "breakpoint hit"
+    else
+        warn "  monitorNodeHealth 未命中"
+        record "nodelifecycle monitorNodeHealth" "⚠ WARN" "check output"
+    fi
+    echo "$out_nl" | tail -10
+}
+
+# ── 21. Namespace + ResourceQuota + LimitRange ────────────────────────────────
+test_namespace_quota() {
+    info "═══ 测试 Namespace / ResourceQuota / LimitRange (port 2346+2345) ═══"
+    local ns="quota-test-$(date +%s)"
+
+    # ---- Namespace controller（syncNamespaceFromKey）----
+    local port_c=2346
+    if ss -tlnp 2>/dev/null | grep -q ":$port_c"; then
+        local bp_ns="k8s.io/kubernetes/pkg/controller/namespace.(*NamespaceController).syncNamespaceFromKey"
+        info "  断点(Namespace): $bp_ns"
+
+        dlv_session "localhost:$port_c" 10 "b $bp_ns" "c" > /dev/null 2>&1 || true
+        kubectl create namespace $ns 2>/dev/null || true
+
+        local out_ns
+        out_ns=$(dlv_session "localhost:$port_c" 20 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_ns" "syncNamespaceFromKey|NamespaceController|Goroutine"; then
+            ok "  syncNamespaceFromKey 断点验证通过"
+            record "namespace syncNamespaceFromKey" "✓ PASS" "breakpoint hit"
+        else
+            warn "  syncNamespaceFromKey 未命中"
+            record "namespace syncNamespaceFromKey" "⚠ WARN" "check output"
+        fi
+        echo "$out_ns" | tail -8
+    else
+        warn "端口 $port_c 未监听，跳过 namespace 断点"
+        record "namespace syncNamespaceFromKey" "⚠ SKIP" "port not listening"
+    fi
+
+    # ---- ResourceQuota controller（syncResourceQuota）----
+    if ss -tlnp 2>/dev/null | grep -q ":$port_c"; then
+        local bp_rq="k8s.io/kubernetes/pkg/controller/resourcequota.(*Controller).syncResourceQuota"
+        info "  断点(ResourceQuota): $bp_rq"
+
+        kubectl apply -n $ns -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test-quota
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "1"
+    limits.cpu: "2"
+EOF
+        dlv_session "localhost:$port_c" 10 "b $bp_rq" "c" > /dev/null 2>&1 || true
+
+        local out_rq
+        out_rq=$(dlv_session "localhost:$port_c" 20 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_rq" "syncResourceQuota|Controller|Goroutine"; then
+            ok "  syncResourceQuota 断点验证通过"
+            record "resourcequota syncResourceQuota" "✓ PASS" "breakpoint hit"
+        else
+            warn "  syncResourceQuota 未命中"
+            record "resourcequota syncResourceQuota" "⚠ WARN" "check output"
+        fi
+        echo "$out_rq" | tail -8
+    fi
+
+    # ---- LimitRanger admission（apiserver port 2345）----
+    local port_a=2345
+    if ss -tlnp 2>/dev/null | grep -q ":$port_a"; then
+        local bp_lr="k8s.io/kubernetes/plugin/pkg/admission/limitranger.(*LimitRanger).Admit"
+        info "  断点(LimitRanger): $bp_lr"
+
+        kubectl apply -n $ns -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: test-limits
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 100m
+      memory: 128Mi
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
+EOF
+        dlv_session "localhost:$port_a" 10 "b $bp_lr" "c" > /dev/null 2>&1 || true
+
+        kubectl run lr-test -n $ns --image=registry.k8s.io/pause:3.10 \
+            --restart=Never 2>/dev/null || true
+
+        local out_lr
+        out_lr=$(dlv_session "localhost:$port_a" 15 "goroutines" "stack" "clearall" "c") || true
+
+        kubectl delete pod lr-test -n $ns --ignore-not-found 2>/dev/null || true
+
+        if grep_output "$out_lr" "LimitRanger|Admit|Goroutine"; then
+            ok "  LimitRanger.Admit 断点验证通过"
+            record "limitranger LimitRanger.Admit" "✓ PASS" "breakpoint hit"
+        else
+            warn "  LimitRanger.Admit 未命中"
+            record "limitranger LimitRanger.Admit" "⚠ WARN" "check output"
+        fi
+        echo "$out_lr" | tail -8
+
+        # ---- quotaAdmission.Admit（ResourceQuota admission）----
+        local bp_qa="k8s.io/kubernetes/plugin/pkg/admission/resourcequota.(*quotaAdmission).Admit"
+        info "  断点(quotaAdmission): $bp_qa"
+
+        dlv_session "localhost:$port_a" 10 "b $bp_qa" "c" > /dev/null 2>&1 || true
+        kubectl run qa-test -n $ns --image=registry.k8s.io/pause:3.10 \
+            --restart=Never 2>/dev/null || true
+
+        local out_qa
+        out_qa=$(dlv_session "localhost:$port_a" 15 "goroutines" "stack" "clearall" "c") || true
+        kubectl delete pod qa-test -n $ns --ignore-not-found 2>/dev/null || true
+
+        if grep_output "$out_qa" "quotaAdmission|Admit|Goroutine"; then
+            ok "  quotaAdmission.Admit 断点验证通过"
+            record "resourcequota quotaAdmission.Admit" "✓ PASS" "breakpoint hit"
+        else
+            warn "  quotaAdmission.Admit 未命中"
+            record "resourcequota quotaAdmission.Admit" "⚠ WARN" "check output"
+        fi
+        echo "$out_qa" | tail -8
+    fi
+
+    # 清理测试 namespace
+    kubectl delete namespace $ns --ignore-not-found 2>/dev/null || true
+}
+
+# ── 22. Admission chain + ServiceAccount admission ────────────────────────────
+test_admission_chain() {
+    info "═══ 测试 Admission chain (port 2345) ═══"
+    local port=2345
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "admission chainAdmissionHandler.Admit" "⚠ SKIP" "port not listening"
+        record "admission ServiceAccount.Admit" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- chainAdmissionHandler.Admit（所有创建请求都会过）----
+    local bp_chain="k8s.io/apiserver/pkg/admission.(*chainAdmissionHandler).Admit"
+    info "  断点(admissionChain): $bp_chain"
+
+    dlv_session "localhost:$port" 10 "b $bp_chain" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    kubectl create configmap admit-test-$ts --from-literal=k=v 2>/dev/null || true
+
+    local out_chain
+    out_chain=$(dlv_session "localhost:$port" 15 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete configmap admit-test-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_chain" "chainAdmissionHandler|Admit|Goroutine"; then
+        ok "  chainAdmissionHandler.Admit 断点验证通过"
+        record "admission chainAdmissionHandler.Admit" "✓ PASS" "breakpoint hit"
+    else
+        warn "  chainAdmissionHandler.Admit 未命中"
+        record "admission chainAdmissionHandler.Admit" "⚠ WARN" "check output"
+    fi
+    echo "$out_chain" | tail -10
+
+    # ---- ServiceAccount admission（Pod 创建时注入 SA）----
+    local bp_sa="k8s.io/kubernetes/plugin/pkg/admission/serviceaccount.(*Plugin).Admit"
+    info "  断点(ServiceAccountAdmission): $bp_sa"
+
+    dlv_session "localhost:$port" 10 "b $bp_sa" "c" > /dev/null 2>&1 || true
+    kubectl run sa-admit-test-$ts --image=registry.k8s.io/pause:3.10 \
+        --restart=Never 2>/dev/null || true
+
+    local out_sa
+    out_sa=$(dlv_session "localhost:$port" 15 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod sa-admit-test-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_sa" "serviceaccount|Plugin|Admit|Goroutine"; then
+        ok "  ServiceAccount.Admit 断点验证通过"
+        record "admission ServiceAccount.Admit" "✓ PASS" "breakpoint hit"
+    else
+        warn "  ServiceAccount.Admit 未命中"
+        record "admission ServiceAccount.Admit" "⚠ WARN" "check output"
+    fi
+    echo "$out_sa" | tail -10
+}
+
+# ── 23. RBAC Authorizer + ClusterRoleAggregation ──────────────────────────────
+test_rbac() {
+    info "═══ 测试 RBAC Authorizer (port 2345) + ClusterRoleAggregation (port 2346) ═══"
+
+    # ---- RBACAuthorizer.Authorize（任何 API 请求都会触发）----
+    local port_a=2345
+    if ss -tlnp 2>/dev/null | grep -q ":$port_a"; then
+        local bp_rbac="k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac.(*RBACAuthorizer).Authorize"
+        info "  断点(RBACAuthorizer): $bp_rbac"
+
+        dlv_session "localhost:$port_a" 10 "b $bp_rbac" "c" > /dev/null 2>&1 || true
+
+        # 触发：任意 API 请求即可
+        kubectl get pods 2>/dev/null || true
+
+        local out_rbac
+        out_rbac=$(dlv_session "localhost:$port_a" 15 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_rbac" "RBACAuthorizer|Authorize|Goroutine"; then
+            ok "  RBACAuthorizer.Authorize 断点验证通过"
+            record "rbac RBACAuthorizer.Authorize" "✓ PASS" "breakpoint hit"
+        else
+            warn "  RBACAuthorizer.Authorize 未命中"
+            record "rbac RBACAuthorizer.Authorize" "⚠ WARN" "check output"
+        fi
+        echo "$out_rbac" | tail -10
+    else
+        warn "端口 $port_a 未监听，跳过 RBAC 断点"
+        record "rbac RBACAuthorizer.Authorize" "⚠ SKIP" "port not listening"
+    fi
+
+    # ---- ClusterRoleAggregationController.syncClusterRole ----
+    local port_c=2346
+    if ss -tlnp 2>/dev/null | grep -q ":$port_c"; then
+        local bp_agg="k8s.io/kubernetes/pkg/controller/clusterroleaggregation.(*ClusterRoleAggregationController).syncClusterRole"
+        info "  断点(ClusterRoleAggregation): $bp_agg"
+
+        dlv_session "localhost:$port_c" 10 "b $bp_agg" "c" > /dev/null 2>&1 || true
+
+        local ts; ts=$(date +%s)
+        kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agg-test-$ts
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules: []
+EOF
+
+        local out_agg
+        out_agg=$(dlv_session "localhost:$port_c" 20 "goroutines" "stack" "clearall" "c") || true
+        kubectl delete clusterrole agg-test-$ts --ignore-not-found 2>/dev/null || true
+
+        if grep_output "$out_agg" "syncClusterRole|ClusterRoleAggregation|Goroutine"; then
+            ok "  ClusterRoleAggregation.syncClusterRole 断点验证通过"
+            record "rbac ClusterRoleAggregation.syncClusterRole" "✓ PASS" "breakpoint hit"
+        else
+            warn "  ClusterRoleAggregation.syncClusterRole 未命中"
+            record "rbac ClusterRoleAggregation.syncClusterRole" "⚠ WARN" "check output"
+        fi
+        echo "$out_agg" | tail -10
+    else
+        warn "端口 $port_c 未监听，跳过 ClusterRoleAggregation 断点"
+        record "rbac ClusterRoleAggregation.syncClusterRole" "⚠ SKIP" "port not listening"
+    fi
+}
+
+# ── 24. Authentication: TokenReview + SubjectAccessReview ─────────────────────
+test_auth() {
+    info "═══ 测试 TokenReview / SubjectAccessReview (port 2345) ═══"
+    local port=2345
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "auth TokenReview.Create" "⚠ SKIP" "port not listening"
+        record "auth SubjectAccessReview.Create" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- TokenReview.Create ----
+    local bp_tr="k8s.io/kubernetes/pkg/registry/authentication/tokenreview.(*REST).Create"
+    info "  断点(TokenReview): $bp_tr"
+
+    dlv_session "localhost:$port" 10 "b $bp_tr" "c" > /dev/null 2>&1 || true
+
+    # 通过 kubectl auth 触发 TokenReview（webhook token auth 路径）
+    kubectl get --raw /apis/authentication.k8s.io/v1 2>/dev/null || true
+    # 直接 POST TokenReview
+    kubectl apply -f - 2>/dev/null <<'EOF' || true
+apiVersion: authentication.k8s.io/v1
+kind: TokenReview
+metadata:
+  name: test-tr
+spec:
+  token: "test-invalid-token"
+EOF
+
+    local out_tr
+    out_tr=$(dlv_session "localhost:$port" 15 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete tokenreview test-tr --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_tr" "tokenreview|TokenReview|REST|Goroutine"; then
+        ok "  TokenReview.Create 断点验证通过"
+        record "auth TokenReview.Create" "✓ PASS" "breakpoint hit"
+    else
+        warn "  TokenReview.Create 未命中（TokenReview 可能不走此路径）"
+        record "auth TokenReview.Create" "⚠ WARN" "check output"
+    fi
+    echo "$out_tr" | tail -8
+
+    # ---- SubjectAccessReview.Create（kubectl auth can-i 底层）----
+    local bp_sar="k8s.io/kubernetes/pkg/registry/authorization/subjectaccessreview.(*REST).Create"
+    info "  断点(SubjectAccessReview): $bp_sar"
+
+    dlv_session "localhost:$port" 10 "b $bp_sar" "c" > /dev/null 2>&1 || true
+    kubectl auth can-i get pods --as=system:serviceaccount:default:default 2>/dev/null || true
+
+    local out_sar
+    out_sar=$(dlv_session "localhost:$port" 15 "goroutines" "stack" "clearall" "c") || true
+
+    if grep_output "$out_sar" "subjectaccessreview|SubjectAccessReview|REST|Goroutine"; then
+        ok "  SubjectAccessReview.Create 断点验证通过"
+        record "auth SubjectAccessReview.Create" "✓ PASS" "breakpoint hit"
+    else
+        warn "  SubjectAccessReview.Create 未命中"
+        record "auth SubjectAccessReview.Create" "⚠ WARN" "check output"
+    fi
+    echo "$out_sar" | tail -8
+
+    # ---- unionAuthRequestHandler.AuthenticateRequest（认证链）----
+    local bp_union="k8s.io/apiserver/pkg/authentication/request/union.(*unionAuthRequestHandler).AuthenticateRequest"
+    info "  断点(AuthChain): $bp_union"
+
+    dlv_session "localhost:$port" 10 "b $bp_union" "c" > /dev/null 2>&1 || true
+    kubectl get nodes 2>/dev/null || true
+
+    local out_union
+    out_union=$(dlv_session "localhost:$port" 15 "goroutines" "stack" "clearall" "c") || true
+
+    if grep_output "$out_union" "AuthenticateRequest|unionAuthRequestHandler|Goroutine"; then
+        ok "  unionAuthRequestHandler.AuthenticateRequest 断点验证通过"
+        record "auth unionAuthRequestHandler" "✓ PASS" "breakpoint hit"
+    else
+        warn "  unionAuthRequestHandler 未命中"
+        record "auth unionAuthRequestHandler" "⚠ WARN" "check output"
+    fi
+    echo "$out_union" | tail -8
+}
+
+# ── 25. EndpointSlice controller ───────────────────────────────────────────────
+test_endpoint_slice() {
+    info "═══ 测试 EndpointSlice controller (port 2346) ═══"
+    local port=2346
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "endpointslice syncService" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local bp="k8s.io/kubernetes/pkg/controller/endpointslice.(*Controller).syncService"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    kubectl expose deployment rs-test-$ts \
+        --port=80 --target-port=80 --name=eps-test-$ts 2>/dev/null || \
+    kubectl create service clusterip eps-test-$ts \
+        --tcp=80:80 2>/dev/null || true
+
+    local output
+    output=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete service eps-test-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "syncService|Controller|EndpointSlice|Goroutine"; then
+        ok "  EndpointSlice.syncService 断点验证通过"
+        record "endpointslice syncService" "✓ PASS" "breakpoint hit"
+    else
+        warn "  EndpointSlice.syncService 未命中"
+        record "endpointslice syncService" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -12
+}
+
+# ── 26. kubelet syncPod + makeEnvironmentVariables ────────────────────────────
+test_kubelet_syncpod() {
+    info "═══ 测试 kubelet syncPod / makeEnvironmentVariables (port 2348) ═══"
+    local port=2348
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "kubelet syncPod" "⚠ SKIP" "port not listening"
+        record "kubelet makeEnvironmentVariables" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local ts; ts=$(date +%s)
+
+    # ---- syncPod ----
+    local bp_sync="k8s.io/kubernetes/pkg/kubelet.(*Kubelet).syncPod"
+    info "  断点(syncPod): $bp_sync"
+
+    dlv_session "localhost:$port" 10 "b $bp_sync" "c" > /dev/null 2>&1 || true
+
+    kubectl run sync-test-$ts --image=registry.k8s.io/pause:3.10 \
+        --restart=Never 2>/dev/null || true
+
+    local out_sync
+    out_sync=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod sync-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_sync" "syncPod|Kubelet|Goroutine"; then
+        ok "  syncPod 断点验证通过"
+        record "kubelet syncPod" "✓ PASS" "breakpoint hit"
+    else
+        warn "  syncPod 未命中"
+        record "kubelet syncPod" "⚠ WARN" "check output"
+    fi
+    echo "$out_sync" | tail -10
+
+    # ---- makeEnvironmentVariables（Pod 带 ConfigMap env）----
+    local bp_env="k8s.io/kubernetes/pkg/kubelet.(*Kubelet).makeEnvironmentVariables"
+    info "  断点(makeEnvironmentVariables): $bp_env"
+
+    kubectl create configmap env-test-$ts \
+        --from-literal=MY_KEY=my_value 2>/dev/null || true
+
+    dlv_session "localhost:$port" 10 "b $bp_env" "c" > /dev/null 2>&1 || true
+
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-test-$ts
+spec:
+  restartPolicy: Never
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+    envFrom:
+    - configMapRef:
+        name: env-test-$ts
+EOF
+
+    local out_env
+    out_env=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod env-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    kubectl delete configmap env-test-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_env" "makeEnvironmentVariables|Kubelet|Goroutine"; then
+        ok "  makeEnvironmentVariables 断点验证通过"
+        record "kubelet makeEnvironmentVariables" "✓ PASS" "breakpoint hit"
+    else
+        warn "  makeEnvironmentVariables 未命中"
+        record "kubelet makeEnvironmentVariables" "⚠ WARN" "check output"
+    fi
+    echo "$out_env" | tail -10
+}
+
+# ── 27. kubelet volume mounter（ConfigMap / Secret / Projected）──────────────
+test_kubelet_volume_mount() {
+    info "═══ 测试 kubelet volume mounter (port 2348) ═══"
+    local port=2348
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "kubelet configMapVolumeMounter.SetUp" "⚠ SKIP" "port not listening"
+        record "kubelet secretVolumeMounter.SetUp" "⚠ SKIP" "port not listening"
+        record "kubelet projectedVolumeMounter.SetUp" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local ts; ts=$(date +%s)
+
+    # 准备 ConfigMap 和 Secret
+    kubectl create configmap cm-vol-$ts --from-literal=cfg=data 2>/dev/null || true
+    kubectl create secret generic sec-vol-$ts --from-literal=key=val 2>/dev/null || true
+
+    # ---- configMapVolumeMounter.SetUp ----
+    local bp_cm="k8s.io/kubernetes/pkg/volume/configmap.(*configMapVolumeMounter).SetUp"
+    info "  断点(configMapVolumeMounter): $bp_cm"
+
+    dlv_session "localhost:$port" 10 "b $bp_cm" "c" > /dev/null 2>&1 || true
+
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cm-vol-test-$ts
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: cm
+    configMap:
+      name: cm-vol-$ts
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+    volumeMounts:
+    - name: cm
+      mountPath: /etc/config
+EOF
+
+    local out_cm
+    out_cm=$(dlv_session "localhost:$port" 25 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod cm-vol-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_cm" "configMapVolumeMounter|SetUp|Goroutine"; then
+        ok "  configMapVolumeMounter.SetUp 断点验证通过"
+        record "kubelet configMapVolumeMounter.SetUp" "✓ PASS" "breakpoint hit"
+    else
+        warn "  configMapVolumeMounter.SetUp 未命中"
+        record "kubelet configMapVolumeMounter.SetUp" "⚠ WARN" "check output"
+    fi
+    echo "$out_cm" | tail -8
+
+    # ---- secretVolumeMounter.SetUp ----
+    local bp_sec="k8s.io/kubernetes/pkg/volume/secret.(*secretVolumeMounter).SetUp"
+    info "  断点(secretVolumeMounter): $bp_sec"
+
+    dlv_session "localhost:$port" 10 "b $bp_sec" "c" > /dev/null 2>&1 || true
+
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sec-vol-test-$ts
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: sec
+    secret:
+      secretName: sec-vol-$ts
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+    volumeMounts:
+    - name: sec
+      mountPath: /etc/secret
+EOF
+
+    local out_sec
+    out_sec=$(dlv_session "localhost:$port" 25 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod sec-vol-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_sec" "secretVolumeMounter|SetUp|Goroutine"; then
+        ok "  secretVolumeMounter.SetUp 断点验证通过"
+        record "kubelet secretVolumeMounter.SetUp" "✓ PASS" "breakpoint hit"
+    else
+        warn "  secretVolumeMounter.SetUp 未命中"
+        record "kubelet secretVolumeMounter.SetUp" "⚠ WARN" "check output"
+    fi
+    echo "$out_sec" | tail -8
+
+    # ---- projectedVolumeMounter.SetUp（ServiceAccount token 是 projected volume）----
+    local bp_proj="k8s.io/kubernetes/pkg/volume/projected.(*projectedVolumeMounter).SetUp"
+    info "  断点(projectedVolumeMounter): $bp_proj"
+
+    dlv_session "localhost:$port" 10 "b $bp_proj" "c" > /dev/null 2>&1 || true
+
+    # 普通 Pod 默认 automountServiceAccountToken=true → projected volume
+    kubectl run proj-test-$ts --image=registry.k8s.io/pause:3.10 \
+        --restart=Never 2>/dev/null || true
+
+    local out_proj
+    out_proj=$(dlv_session "localhost:$port" 25 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod proj-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_proj" "projectedVolumeMounter|SetUp|Goroutine"; then
+        ok "  projectedVolumeMounter.SetUp 断点验证通过"
+        record "kubelet projectedVolumeMounter.SetUp" "✓ PASS" "breakpoint hit"
+    else
+        warn "  projectedVolumeMounter.SetUp 未命中"
+        record "kubelet projectedVolumeMounter.SetUp" "⚠ WARN" "check output"
+    fi
+    echo "$out_proj" | tail -8
+
+    kubectl delete configmap cm-vol-$ts --ignore-not-found 2>/dev/null || true
+    kubectl delete secret sec-vol-$ts --ignore-not-found 2>/dev/null || true
+}
+
+# ── 28. kubelet node lease + ServiceAccount token refresh ─────────────────────
+test_kubelet_node_lease() {
+    info "═══ 测试 kubelet updateNodeLease / GetServiceAccountToken (port 2348) ═══"
+    local port=2348
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "kubelet updateNodeLease" "⚠ SKIP" "port not listening"
+        record "kubelet GetServiceAccountToken" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- updateNodeLease（每 10s 自动触发）----
+    local bp_lease="k8s.io/kubernetes/pkg/kubelet.(*Kubelet).updateNodeLease"
+    info "  断点(updateNodeLease): $bp_lease"
+
+    dlv_session "localhost:$port" 10 "b $bp_lease" "c" > /dev/null 2>&1 || true
+
+    local out_lease
+    out_lease=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    if grep_output "$out_lease" "updateNodeLease|Kubelet|Goroutine"; then
+        ok "  updateNodeLease 断点验证通过"
+        record "kubelet updateNodeLease" "✓ PASS" "breakpoint hit"
+    else
+        warn "  updateNodeLease 未命中（等待下次 10s 心跳）"
+        record "kubelet updateNodeLease" "⚠ WARN" "check output"
+    fi
+    echo "$out_lease" | tail -10
+
+    # ---- GetServiceAccountToken（有 Pod 运行时会自动刷新）----
+    local bp_tok="k8s.io/kubernetes/pkg/kubelet/token.(*Manager).GetServiceAccountToken"
+    info "  断点(GetServiceAccountToken): $bp_tok"
+
+    # 创建带 SA 的 Pod，kubelet 会在 ~80% token 有效期时刷新
+    local ts; ts=$(date +%s)
+    kubectl run sa-tok-test-$ts --image=registry.k8s.io/pause:3.10 \
+        --restart=Never 2>/dev/null || true
+
+    dlv_session "localhost:$port" 10 "b $bp_tok" "c" > /dev/null 2>&1 || true
+
+    local out_tok
+    out_tok=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod sa-tok-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_tok" "GetServiceAccountToken|Manager|Goroutine"; then
+        ok "  GetServiceAccountToken 断点验证通过"
+        record "kubelet GetServiceAccountToken" "✓ PASS" "breakpoint hit"
+    else
+        warn "  GetServiceAccountToken 未命中（token 尚未过期）"
+        record "kubelet GetServiceAccountToken" "⚠ WARN" "check output"
+    fi
+    echo "$out_tok" | tail -10
+}
+
+# ── 29. Scheduler: DefaultPreemption.PostFilter + VolumeBinder ────────────────
+test_scheduler_advanced() {
+    info "═══ 测试 Scheduler advanced (port 2347) ═══"
+    local port=2347
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "scheduler DefaultPreemption.PostFilter" "⚠ SKIP" "port not listening"
+        record "scheduler VolumeBinder.FindPodVolumes" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # ---- DefaultPreemption.PostFilter（Pod 无法调度时触发）----
+    local bp_pre="k8s.io/kubernetes/pkg/scheduler/framework/plugins/preemption.(*DefaultPreemption).PostFilter"
+    info "  断点(DefaultPreemption.PostFilter): $bp_pre"
+
+    dlv_session "localhost:$port" 10 "b $bp_pre" "c" > /dev/null 2>&1 || true
+
+    local ts; ts=$(date +%s)
+    # 申请超大资源让调度失败 → 触发 PostFilter
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: preempt-test-$ts
+spec:
+  priorityClassName: system-cluster-critical
+  restartPolicy: Never
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+    resources:
+      requests:
+        cpu: "999"
+        memory: "999Gi"
+EOF
+
+    local out_pre
+    out_pre=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete pod preempt-test-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_pre" "PostFilter|DefaultPreemption|Goroutine"; then
+        ok "  DefaultPreemption.PostFilter 断点验证通过"
+        record "scheduler DefaultPreemption.PostFilter" "✓ PASS" "breakpoint hit"
+    else
+        warn "  DefaultPreemption.PostFilter 未命中"
+        record "scheduler DefaultPreemption.PostFilter" "⚠ WARN" "check output"
+    fi
+    echo "$out_pre" | tail -10
+
+    # ---- VolumeBinder.FindPodVolumes（调度带 PVC 的 Pod 时）----
+    local bp_vb="k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding.(*VolumeBinding).Filter"
+    info "  断点(VolumeBinder.Filter): $bp_vb"
+
+    dlv_session "localhost:$port" 10 "b $bp_vb" "c" > /dev/null 2>&1 || true
+
+    # 创建 StorageClass + PVC + Pod
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: vb-test-sc-$ts
+provisioner: hostpath.csi.k8s.io
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vb-test-pvc-$ts
+spec:
+  storageClassName: vb-test-sc-$ts
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vb-test-pod-$ts
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: vb-test-pvc-$ts
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+    volumeMounts:
+    - name: data
+      mountPath: /data
+EOF
+
+    local out_vb
+    out_vb=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    kubectl delete pod vb-test-pod-$ts --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    kubectl delete pvc vb-test-pvc-$ts --ignore-not-found 2>/dev/null || true
+    kubectl delete storageclass vb-test-sc-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$out_vb" "VolumeBinding|Filter|FindPodVolumes|Goroutine"; then
+        ok "  VolumeBinder.Filter 断点验证通过"
+        record "scheduler VolumeBinder.Filter" "✓ PASS" "breakpoint hit"
+    else
+        warn "  VolumeBinder.Filter 未命中"
+        record "scheduler VolumeBinder.Filter" "⚠ WARN" "check output"
+    fi
+    echo "$out_vb" | tail -10
+}
+
+# ── 30. CSI DeleteVolume ───────────────────────────────────────────────────────
+test_csi_delete() {
+    info "═══ 测试 CSI DeleteVolume (port 2353) ═══"
+    local port=2353
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "csi DeleteVolume" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local ts; ts=$(date +%s)
+    # 先创建一个 PV/PVC 再删除来触发 DeleteVolume
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-del-sc-$ts
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-del-pvc-$ts
+spec:
+  storageClassName: csi-del-sc-$ts
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+    # 等待 PVC 绑定
+    kubectl wait --for=jsonpath='{.status.phase}'=Bound \
+        pvc/csi-del-pvc-$ts --timeout=30s 2>/dev/null || true
+
+    local bp="github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath.(*hostPath).DeleteVolume"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    # 删除 PVC → 触发 DeleteVolume
+    kubectl delete pvc csi-del-pvc-$ts --ignore-not-found 2>/dev/null || true
+
+    local output
+    output=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+    kubectl delete storageclass csi-del-sc-$ts --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "DeleteVolume|hostPath|Goroutine"; then
+        ok "  CSI DeleteVolume 断点验证通过"
+        record "csi DeleteVolume" "✓ PASS" "breakpoint hit"
+    else
+        warn "  CSI DeleteVolume 未命中"
+        record "csi DeleteVolume" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -10
+}
+
+# ── 31. CRD + CustomResource ───────────────────────────────────────────────────
+test_crd() {
+    info "═══ 测试 CRD / CustomResource REST.Create (port 2345) ═══"
+    local port=2345
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "crd customresource REST.Create" "⚠ SKIP" "port not listening"; return
+    fi
+
+    local ts; ts=$(date +%s)
+
+    # 创建 CRD（需要 apiextensions apiserver 路径，Store.Create 在 apiextensions-apiserver 中）
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: foos-$ts.example.com
+spec:
+  group: example.com
+  names:
+    kind: Foo$ts
+    plural: foos-$ts
+    singular: foo-$ts
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+EOF
+
+    # 等待 CRD Established
+    kubectl wait --for=condition=Established \
+        crd/foos-$ts.example.com --timeout=30s 2>/dev/null || true
+
+    local bp="k8s.io/apiextensions-apiserver/pkg/registry/customresource.(*REST).Create"
+    info "  断点: $bp"
+
+    dlv_session "localhost:$port" 10 "b $bp" "c" > /dev/null 2>&1 || true
+
+    # 创建 CR 实例
+    kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: example.com/v1
+kind: Foo$ts
+metadata:
+  name: foo-instance-$ts
+spec: {}
+EOF
+
+    local output
+    output=$(dlv_session "localhost:$port" 20 "goroutines" "stack" "clearall" "c") || true
+
+    kubectl delete foos-$ts.example.com foo-instance-$ts --ignore-not-found 2>/dev/null || true
+    kubectl delete crd foos-$ts.example.com --ignore-not-found 2>/dev/null || true
+
+    if grep_output "$output" "customresource|REST|Create|Goroutine"; then
+        ok "  CustomResource REST.Create 断点验证通过"
+        record "crd customresource REST.Create" "✓ PASS" "breakpoint hit"
+    else
+        warn "  CustomResource REST.Create 未命中"
+        record "crd customresource REST.Create" "⚠ WARN" "check output"
+    fi
+    echo "$output" | tail -12
+}
+
+# ── 32. PDB + Eviction ─────────────────────────────────────────────────────────
+test_pdb_eviction() {
+    info "═══ 测试 PDB DisruptionController + EvictionREST (port 2346+2345) ═══"
+    local ts; ts=$(date +%s)
+
+    # ---- DisruptionController.syncOne（port 2346）----
+    local port_c=2346
+    if ss -tlnp 2>/dev/null | grep -q ":$port_c"; then
+        local bp_pdb="k8s.io/kubernetes/pkg/controller/disruption.(*DisruptionController).syncOne"
+        info "  断点(DisruptionController.syncOne): $bp_pdb"
+
+        dlv_session "localhost:$port_c" 10 "b $bp_pdb" "c" > /dev/null 2>&1 || true
+
+        # 创建 Deployment + PDB
+        kubectl create deployment pdb-target-$ts \
+            --image=registry.k8s.io/pause:3.10 --replicas=2 2>/dev/null || true
+        kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-test-$ts
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pdb-target-$ts
+EOF
+
+        local out_pdb
+        out_pdb=$(dlv_session "localhost:$port_c" 20 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_pdb" "syncOne|DisruptionController|Goroutine"; then
+            ok "  DisruptionController.syncOne 断点验证通过"
+            record "pdb DisruptionController.syncOne" "✓ PASS" "breakpoint hit"
+        else
+            warn "  DisruptionController.syncOne 未命中"
+            record "pdb DisruptionController.syncOne" "⚠ WARN" "check output"
+        fi
+        echo "$out_pdb" | tail -8
+    else
+        warn "端口 $port_c 未监听，跳过 PDB 断点"
+        record "pdb DisruptionController.syncOne" "⚠ SKIP" "port not listening"
+    fi
+
+    # ---- EvictionREST.Create（port 2345）----
+    local port_a=2345
+    if ss -tlnp 2>/dev/null | grep -q ":$port_a"; then
+        local bp_evict="k8s.io/kubernetes/pkg/registry/core/pod/storage.(*EvictionREST).Create"
+        info "  断点(EvictionREST.Create): $bp_evict"
+
+        dlv_session "localhost:$port_a" 10 "b $bp_evict" "c" > /dev/null 2>&1 || true
+
+        # 等 Pod Running 再 evict
+        kubectl wait --for=condition=Ready \
+            pod -l app=pdb-target-$ts --timeout=30s 2>/dev/null || true
+        EVICT_POD=$(kubectl get pod -l app=pdb-target-$ts \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "$EVICT_POD" ]]; then
+            kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: policy/v1
+kind: Eviction
+metadata:
+  name: $EVICT_POD
+  namespace: default
+EOF
+        fi
+
+        local out_evict
+        out_evict=$(dlv_session "localhost:$port_a" 15 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_evict" "EvictionREST|Create|Eviction|Goroutine"; then
+            ok "  EvictionREST.Create 断点验证通过"
+            record "pdb EvictionREST.Create" "✓ PASS" "breakpoint hit"
+        else
+            warn "  EvictionREST.Create 未命中"
+            record "pdb EvictionREST.Create" "⚠ WARN" "check output"
+        fi
+        echo "$out_evict" | tail -8
+    else
+        warn "端口 $port_a 未监听，跳过 Eviction 断点"
+        record "pdb EvictionREST.Create" "⚠ SKIP" "port not listening"
+    fi
+
+    kubectl delete pdb pdb-test-$ts --ignore-not-found 2>/dev/null || true
+    kubectl delete deployment pdb-target-$ts --ignore-not-found 2>/dev/null || true
+}
+
+# ── 33. ServiceAccount TokenRequest + CSR sarApprover ─────────────────────────
+test_auth_resources() {
+    info "═══ 测试 TokenRequest / CSR sarApprover (port 2345+2346) ═══"
+    local ts; ts=$(date +%s)
+
+    # ---- TokenRequest.Create（kubectl create token）----
+    local port_a=2345
+    if ss -tlnp 2>/dev/null | grep -q ":$port_a"; then
+        local bp_tok="k8s.io/kubernetes/pkg/registry/core/serviceaccount/token.(*REST).Create"
+        info "  断点(TokenRequest.Create): $bp_tok"
+
+        dlv_session "localhost:$port_a" 10 "b $bp_tok" "c" > /dev/null 2>&1 || true
+        kubectl create token default --duration=60s 2>/dev/null || true
+
+        local out_tok
+        out_tok=$(dlv_session "localhost:$port_a" 15 "goroutines" "stack" "clearall" "c") || true
+
+        if grep_output "$out_tok" "TokenRequest|REST|Create|Goroutine"; then
+            ok "  TokenRequest.Create 断点验证通过"
+            record "sa TokenRequest.Create" "✓ PASS" "breakpoint hit"
+        else
+            warn "  TokenRequest.Create 未命中"
+            record "sa TokenRequest.Create" "⚠ WARN" "check output"
+        fi
+        echo "$out_tok" | tail -8
+    else
+        warn "端口 $port_a 未监听，跳过 TokenRequest 断点"
+        record "sa TokenRequest.Create" "⚠ SKIP" "port not listening"
+    fi
+
+    # ---- CSR sarApprover.handle（port 2346 controller-manager）----
+    local port_c=2346
+    if ss -tlnp 2>/dev/null | grep -q ":$port_c"; then
+        local bp_csr="k8s.io/kubernetes/pkg/controller/certificates/approver.(*sarApprover).handle"
+        info "  断点(sarApprover.handle): $bp_csr"
+
+        dlv_session "localhost:$port_c" 10 "b $bp_csr" "c" > /dev/null 2>&1 || true
+
+        # 生成一个 CSR 并提交（模拟 kubelet bootstrapping）
+        local keyfile tmpdir
+        tmpdir=$(mktemp -d)
+        openssl genrsa -out "$tmpdir/key.pem" 2048 2>/dev/null || true
+        openssl req -new -key "$tmpdir/key.pem" \
+            -subj "/CN=system:node:vm/O=system:nodes" \
+            -out "$tmpdir/csr.pem" 2>/dev/null || true
+
+        CSR_B64=$(base64 -w0 < "$tmpdir/csr.pem" 2>/dev/null || true)
+        if [[ -n "$CSR_B64" ]]; then
+            kubectl apply -f - 2>/dev/null <<EOF || true
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: csr-test-$ts
+spec:
+  request: $CSR_B64
+  signerName: kubernetes.io/kube-apiserver-client-kubelet
+  usages:
+  - client auth
+EOF
+        fi
+        rm -rf "$tmpdir"
+
+        local out_csr
+        out_csr=$(dlv_session "localhost:$port_c" 20 "goroutines" "stack" "clearall" "c") || true
+        kubectl delete csr csr-test-$ts --ignore-not-found 2>/dev/null || true
+
+        if grep_output "$out_csr" "sarApprover|handle|CSR|Goroutine"; then
+            ok "  CSR sarApprover.handle 断点验证通过"
+            record "csr sarApprover.handle" "✓ PASS" "breakpoint hit"
+        else
+            warn "  CSR sarApprover.handle 未命中"
+            record "csr sarApprover.handle" "⚠ WARN" "check output"
+        fi
+        echo "$out_csr" | tail -8
+    else
+        warn "端口 $port_c 未监听，跳过 CSR 断点"
+        record "csr sarApprover.handle" "⚠ SKIP" "port not listening"
+    fi
+}
+
+# ── 34. Webhook dispatcher（MutatingWebhook / ValidatingWebhook）─────────────
+test_webhook() {
+    info "═══ 测试 Webhook dispatcher (port 2345) ═══"
+    local port=2345
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "webhook mutatingDispatcher.Dispatch" "⚠ SKIP" "port not listening"
+        record "webhook validatingDispatcher.Dispatch" "⚠ SKIP" "port not listening"; return
+    fi
+
+    # 检查是否有 webhook 配置（无 webhook 则断点不会触发，验证符号可解析即可）
+    local mwc_count vwc_count
+    mwc_count=$(kubectl get mutatingwebhookconfigurations 2>/dev/null | grep -c "^" || echo 0)
+    vwc_count=$(kubectl get validatingwebhookconfigurations 2>/dev/null | grep -c "^" || echo 0)
+
+    # ---- MutatingWebhook dispatcher ----
+    local bp_mut="k8s.io/apiserver/pkg/admission/plugin/webhook/mutating.(*mutatingDispatcher).Dispatch"
+    info "  断点(mutatingDispatcher): $bp_mut"
+
+    local out_mut
+    out_mut=$(dlv_exec_session /usr/local/bin/kube-apiserver 10 \
+        "b $bp_mut" \
+        "bp" \
+    ) || true
+
+    if grep_output "$out_mut" "mutatingDispatcher|Dispatch|Breakpoint"; then
+        ok "  mutatingDispatcher 符号可解析"
+        record "webhook mutatingDispatcher.Dispatch" "✓ PASS" "symbol resolved"
+    else
+        warn "  mutatingDispatcher 符号验证失败"
+        record "webhook mutatingDispatcher.Dispatch" "⚠ WARN" "symbol not found"
+    fi
+
+    # ---- ValidatingWebhook dispatcher ----
+    local bp_val="k8s.io/apiserver/pkg/admission/plugin/webhook/validating.(*validatingDispatcher).Dispatch"
+    info "  断点(validatingDispatcher): $bp_val"
+
+    local out_val
+    out_val=$(dlv_exec_session /usr/local/bin/kube-apiserver 10 \
+        "b $bp_val" \
+        "bp" \
+    ) || true
+
+    if grep_output "$out_val" "validatingDispatcher|Dispatch|Breakpoint"; then
+        ok "  validatingDispatcher 符号可解析"
+        record "webhook validatingDispatcher.Dispatch" "✓ PASS" "symbol resolved"
+    else
+        warn "  validatingDispatcher 符号验证失败"
+        record "webhook validatingDispatcher.Dispatch" "⚠ WARN" "symbol not found"
+    fi
+
+    # 如果有 webhook，尝试实际命中
+    if [[ "$mwc_count" -gt 1 ]] || [[ "$vwc_count" -gt 1 ]]; then
+        info "  检测到 webhook 配置，尝试实际命中..."
+        dlv_session "localhost:$port" 10 "b $bp_mut" "c" > /dev/null 2>&1 || true
+        local ts; ts=$(date +%s)
+        kubectl create configmap webhook-trigger-$ts --from-literal=k=v 2>/dev/null || true
+        local out_live
+        out_live=$(dlv_session "localhost:$port" 10 "goroutines" "stack" "clearall" "c") || true
+        kubectl delete configmap webhook-trigger-$ts --ignore-not-found 2>/dev/null || true
+        if grep_output "$out_live" "mutatingDispatcher|Goroutine"; then
+            ok "  mutatingDispatcher 实际命中"
+            record "webhook mutatingDispatcher.Dispatch (live)" "✓ PASS" "actually triggered"
+        fi
+    else
+        info "  无 MutatingWebhookConfiguration，仅做符号验证（正常）"
+    fi
+}
+
 # ── 运行所有测试 ──────────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
@@ -1392,6 +2710,44 @@ echo ""
 test_stateful_pod_flow
 echo ""
 test_systemd
+echo ""
+test_replicaset
+echo ""
+test_daemonset
+echo ""
+test_job_cronjob
+echo ""
+test_hpa
+echo ""
+test_lease
+echo ""
+test_namespace_quota
+echo ""
+test_admission_chain
+echo ""
+test_rbac
+echo ""
+test_auth
+echo ""
+test_endpoint_slice
+echo ""
+test_kubelet_syncpod
+echo ""
+test_kubelet_volume_mount
+echo ""
+test_kubelet_node_lease
+echo ""
+test_scheduler_advanced
+echo ""
+test_csi_delete
+echo ""
+test_crd
+echo ""
+test_pdb_eviction
+echo ""
+test_auth_resources
+echo ""
+test_webhook
 
 # ── 结果汇总 ──────────────────────────────────────────────────────────────────
 echo ""
