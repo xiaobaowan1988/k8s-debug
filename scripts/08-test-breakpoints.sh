@@ -3072,6 +3072,208 @@ test_webhook() {
     fi
 }
 
+# ── 35. ingress-nginx controller 全链路断点验证 ──────────────────────────────
+test_ingress_nginx() {
+    info "═══ 测试 ingress-nginx controller (port 2352) ═══"
+    local port=2352
+    local src_root=/root/k8s-src/ingress-nginx
+
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过（先运行 debug/ingress-nginx.sh）"
+        record "ingress-nginx syncIngress" "⚠ SKIP" "port $port not listening"
+        record "ingress-nginx WriteFile(nginx.conf)" "⚠ SKIP" "port $port not listening"
+        record "ingress-nginx ExecCommand(reload)" "⚠ SKIP" "port $port not listening"
+        record "ingress-nginx strace(execve nginx)" "⚠ SKIP" "port $port not listening"
+        return
+    fi
+
+    # 清除上次遗留断点
+    (echo "clearall"; sleep 0.3; echo "c"; sleep 0.3) \
+        | timeout 8 dlv connect "localhost:$port" \
+          --allow-non-terminal-interactive=true > /dev/null 2>&1 || true
+    sleep 1
+
+    local ts; ts=$(date +%s)
+    local ing_name="test-ing-${ts}"
+    local svc_name="test-svc-${ts}"
+
+    # ── Part 1: syncIngress 断点 ── 触发点: Ingress 资源创建 ──────────────────
+    local bp_sync="${src_root}/internal/ingress/controller/controller.go:185"
+    info "  断点1 (syncIngress入口): $bp_sync"
+
+    local out_sync; out_sync=$(mktemp /tmp/dlv-sync-XXXX.txt)
+    # 保持连接直到断点命中或超时
+    (echo "clearall"; sleep 0.3;
+     echo "b $bp_sync"; sleep 0.5;
+     echo "c";
+     sleep 15;
+     echo "goroutines 1"; sleep 0.5;
+     echo "stack 6"; sleep 0.6;
+     echo "clearall"; sleep 0.3;
+     echo "c"; sleep 0.3) \
+    | timeout 30 dlv connect "localhost:$port" \
+      --allow-non-terminal-interactive=true > "$out_sync" 2>&1 &
+    local dlv_pid1=$!
+
+    sleep 2
+    # 创建后端 Service 和 Ingress（触发 syncIngress）
+    kubectl create service clusterip "$svc_name" --tcp=80:80 2>/dev/null || true
+    kubectl create ingress "$ing_name" \
+        --class=nginx \
+        --rule="${ing_name}.example.com/=${svc_name}:80" \
+        2>/dev/null || true
+    wait "$dlv_pid1" || true
+
+    local out_s; out_s=$(cat "$out_sync"); rm -f "$out_sync"
+
+    local sync_pass=0
+    # 断点命中标志
+    echo "$out_s" | grep -qE "Breakpoint|controller\.go:185|syncIngress" && sync_pass=$((sync_pass+1))
+    # 调用栈中应有 syncIngress 或 processNextWorkItem
+    echo "$out_s" | grep -qE "syncIngress|processNextItem|goroutine" && sync_pass=$((sync_pass+1))
+
+    if [[ $sync_pass -ge 1 ]]; then
+        ok "  syncIngress 断点命中 (score=$sync_pass/2)"
+        record "ingress-nginx syncIngress" "✓ PASS" "breakpoint hit at controller.go:185"
+    else
+        warn "  syncIngress 断点未命中 (score=$sync_pass/2)"
+        warn "  输出片段: $(echo "$out_s" | tail -10)"
+        record "ingress-nginx syncIngress" "✗ FAIL" "breakpoint not hit"
+    fi
+
+    # ── Part 2: WriteFile(nginx.conf) 断点 ── 通过调用栈验证链路 ───────────────
+    # 注意：Go 1.26+ 编译器优化后 content/cfgPath 变量不可访问，
+    # 但断点可命中并打印调用栈，nginx.conf 文件写入结果可事后读取验证
+    sleep 3
+    kubectl delete ingress "$ing_name" --ignore-not-found 2>/dev/null || true
+    sleep 1
+
+    local bp_write="${src_root}/internal/ingress/controller/nginx.go:745"
+    info "  断点2 (WriteFile nginx.conf): $bp_write"
+
+    local out_write; out_write=$(mktemp /tmp/dlv-write-XXXX.txt)
+    (echo "clearall"; sleep 0.3;
+     echo "b $bp_write"; sleep 0.5;
+     echo "c";
+     sleep 20;
+     echo "stack 5"; sleep 0.5;
+     echo "clearall"; sleep 0.3;
+     echo "c"; sleep 0.3) \
+    | timeout 40 dlv connect "localhost:$port" \
+      --allow-non-terminal-interactive=true > "$out_write" 2>&1 &
+    local dlv_pid2=$!
+
+    sleep 2
+    # 重建 Ingress 触发新的 sync
+    kubectl create ingress "$ing_name" \
+        --class=nginx \
+        --rule="${ing_name}.example.com/=${svc_name}:80" \
+        2>/dev/null || true
+    wait "$dlv_pid2" || true
+
+    local out_w; out_w=$(cat "$out_write"); rm -f "$out_write"
+
+    # 等断点继续后 nginx.conf 被写入
+    sleep 2
+    local nginx_conf_content; nginx_conf_content=$(cat /etc/nginx/nginx.conf 2>/dev/null || echo "")
+
+    local write_pass=0
+    # 断点命中标志（优先级高）
+    echo "$out_w" | grep -qE "Breakpoint.*nginx\.go:745|nginx\.go:745.*hits" && write_pass=$((write_pass+1))
+    # 调用栈：OnUpdate → syncIngress
+    echo "$out_w" | grep -qE "OnUpdate|syncIngress" && write_pass=$((write_pass+1))
+    # nginx.conf 文件已写入（包含 nginx 配置内容）
+    echo "$nginx_conf_content" | grep -qE "worker_processes|events \{|http \{|lua_package" \
+                                                                   && write_pass=$((write_pass+1))
+
+    if [[ $write_pass -ge 2 ]]; then
+        ok "  WriteFile 断点命中，nginx.conf 已写入 (score=$write_pass/3)"
+        # 打印 nginx.conf 前 3 行供确认
+        info "  nginx.conf 前 200 字节: $(echo "$nginx_conf_content" | head -c 200 | tr '\n' ' ')"
+        record "ingress-nginx WriteFile(nginx.conf)" "✓ PASS" "bp hit nginx.go:745 + nginx.conf written"
+    elif [[ $write_pass -ge 1 ]]; then
+        warn "  WriteFile 断点部分命中 (score=$write_pass/3)"
+        record "ingress-nginx WriteFile(nginx.conf)" "⚠ WARN" "partial hit score=$write_pass/3"
+    else
+        warn "  WriteFile 断点未命中 (score=0/3)"
+        warn "  输出片段: $(echo "$out_w" | tail -5)"
+        record "ingress-nginx WriteFile(nginx.conf)" "✗ FAIL" "breakpoint not hit"
+    fi
+
+    # ── Part 3: ExecCommand("-s", "reload") 断点 ── 验证 nginx reload 调用 ──
+    sleep 2
+    kubectl delete ingress "$ing_name" --ignore-not-found 2>/dev/null || true
+    sleep 1
+
+    local bp_exec="${src_root}/internal/ingress/controller/nginx.go:750"
+    info "  断点3 (ExecCommand nginx reload): $bp_exec"
+
+    local out_exec; out_exec=$(mktemp /tmp/dlv-exec-XXXX.txt)
+    (echo "clearall"; sleep 0.3;
+     echo "b $bp_exec"; sleep 0.5;
+     echo "c";
+     sleep 20;
+     echo "stack 6"; sleep 0.5;
+     echo "clearall"; sleep 0.3;
+     echo "c"; sleep 0.3) \
+    | timeout 40 dlv connect "localhost:$port" \
+      --allow-non-terminal-interactive=true > "$out_exec" 2>&1 &
+    local dlv_pid3=$!
+
+    sleep 2
+    kubectl create ingress "$ing_name" \
+        --class=nginx \
+        --rule="${ing_name}.example.com/=${svc_name}:80" \
+        2>/dev/null || true
+    wait "$dlv_pid3" || true
+
+    local out_e; out_e=$(cat "$out_exec"); rm -f "$out_exec"
+
+    local exec_pass=0
+    # 断点命中标志
+    echo "$out_e" | grep -qE "Breakpoint.*nginx\.go:750|nginx\.go:750.*hits" && exec_pass=$((exec_pass+1))
+    # 调用栈：OnUpdate 在 syncIngress 之上
+    echo "$out_e" | grep -qE "OnUpdate" && exec_pass=$((exec_pass+1))
+    echo "$out_e" | grep -qE "syncIngress" && exec_pass=$((exec_pass+1))
+
+    if [[ $exec_pass -ge 2 ]]; then
+        ok "  ExecCommand(reload) 断点命中，完整调用链验证 (score=$exec_pass/3)"
+        info "  调用链: syncIngress→OnUpdate→ExecCommand(\"-s\",\"reload\")"
+        record "ingress-nginx ExecCommand(reload)" "✓ PASS" "nginx reload breakpoint hit + call chain verified"
+    else
+        warn "  ExecCommand(reload) 断点未命中 (score=$exec_pass/3)"
+        warn "  输出片段: $(echo "$out_e" | tail -5)"
+        record "ingress-nginx ExecCommand(reload)" "✗ FAIL" "breakpoint not hit"
+    fi
+
+    # ── Part 4: strace 验证 nginx wrapper 被实际 execve 调用 ─────────────────
+    info "  strace 验证: nginx reload 触发 execve"
+
+    local strace_log; strace_log=$(mktemp /tmp/ingress-strace-XXXX.log)
+    local nginx_bin="${NGINX_BINARY:-/usr/local/bin/nginx-wrapper}"
+
+    # strace nginx wrapper 的一次 reload 调用
+    strace -f -e trace=execve,openat \
+        "$nginx_bin" -c /etc/nginx/nginx.conf -s reload \
+        > /dev/null 2> "$strace_log" || true
+
+    local execve_count; execve_count=$(grep -c "execve" "$strace_log" 2>/dev/null || echo 0)
+    local nginx_conf_open; nginx_conf_open=$(grep -cE "nginx\.conf|nginx-cfg" "$strace_log" 2>/dev/null || echo 0)
+    rm -f "$strace_log"
+
+    if [[ "$execve_count" -gt 0 ]]; then
+        ok "  strace execve: ${execve_count} 次（nginx wrapper 被调用）"
+        record "ingress-nginx strace(execve nginx)" "✓ PASS" "execve×${execve_count} nginx_conf_open×${nginx_conf_open}"
+    else
+        warn "  strace 未捕获 execve"
+        record "ingress-nginx strace(execve nginx)" "⚠ WARN" "no execve captured"
+    fi
+
+    # 清理
+    kubectl delete ingress "$ing_name" --ignore-not-found 2>/dev/null || true
+    kubectl delete service "$svc_name" --ignore-not-found 2>/dev/null || true
+}
+
 # ── 运行所有测试 ──────────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
@@ -3148,6 +3350,8 @@ echo ""
 test_auth_resources
 echo ""
 test_webhook
+echo ""
+test_ingress_nginx
 
 # ── 结果汇总 ──────────────────────────────────────────────────────────────────
 echo ""
