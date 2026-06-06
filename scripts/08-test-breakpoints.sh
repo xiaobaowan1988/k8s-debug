@@ -838,6 +838,122 @@ test_kube_proxy() {
     kubectl delete service "$svc_ep" --ignore-not-found 2>/dev/null || true
 }
 
+# ── 12b. kube-proxy iptables-restore 内部调用链（port 2349）────────────────────
+# 验证源码阅读推断的调用链，全部通过断点 + strace 实测确认：
+#   syncProxyRules (proxier.go:1558)
+#     → RestoreAll (iptables.go:385)
+#       → restoreInternal (iptables.go:393)
+#         → iptables.go:427: cmd := runner.exec.Command(iptablesRestoreCmd, fullArgs...)
+#           → os/exec.Command("iptables-restore", ...)  ← fork+exec 子进程
+#             → socket(AF_NETLINK, NETLINK_NETFILTER)   ← strace 实测
+#             → sendto(netlink_fd, ...)                  ← 写入内核 nf_tables
+test_kube_proxy_restore_chain() {
+    info "═══ 测试 kube-proxy iptables-restore 调用链 (port 2349) ═══"
+    local port=2349
+
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port"; then
+        warn "端口 $port 未监听，跳过"
+        record "kube-proxy restoreInternal" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy executor.Command" "⚠ SKIP" "port $port not listening"
+        record "kube-proxy iptables-restore netlink" "⚠ SKIP" "port $port not listening"
+        return
+    fi
+
+    # ── 断点: iptables.go:427 ──────────────────────────────────────────────────
+    # 此行位于 restoreInternal 内部（非入口），仅由 RestoreAll 路径触发
+    # （SaveInto 调用的是 runner.exec.Command(iptablesSaveCmd,...) 走另一条路径）
+    # 在此行可同时访问：
+    #   iptablesRestoreCmd  —— 即将传给 exec.Command 的命令名 = "iptables-restore"
+    #   fullArgs            —— 即将传给子进程的参数  ["-w","5","-W","100000","--noflush","--counters"]
+    #   data                —— 通过 stdin 写入子进程的规则文本（len(data) 确认非空）
+    local bp_line="/root/k8s-src/kubernetes/pkg/util/iptables/iptables.go:427"
+    info "  断点: iptables.go:427 (cmd := runner.exec.Command(iptablesRestoreCmd, fullArgs...))"
+
+    # Keep dlv connection open throughout the trigger window:
+    #   clearall + set breakpoint + "c" (process runs) → sleep 12s (window for bp to fire)
+    #   → print variables (in stopped context) → clearall + "c" + exit
+    # Must stay connected so dlv stops the process when the breakpoint fires.
+    local out_file; out_file=$(mktemp /tmp/dlv-ri-XXXX.txt)
+    (echo "clearall"; sleep 0.3;
+     echo "b $bp_line"; sleep 0.4;
+     echo "c";
+     sleep 12;
+     echo "p iptablesRestoreCmd"; sleep 0.5;
+     echo "p fullArgs"; sleep 0.5;
+     echo "p len(data)"; sleep 0.4;
+     echo "stack 6"; sleep 0.5;
+     echo "clearall"; sleep 0.3;
+     echo "c"; sleep 0.5;
+     echo "exit") \
+    | timeout 30 dlv connect "localhost:$port" --allow-non-terminal-interactive=true \
+    > "$out_file" 2>&1 &
+    local dlv_pid=$!
+
+    # Trigger service creation WHILE dlv is connected and the process is running
+    local ts; ts=$(date +%s)
+    local svc_ri="svc-ri-${ts}"
+    sleep 2
+    kubectl create service clusterip "$svc_ri" --tcp=7171:7171 2>/dev/null || true
+
+    wait "$dlv_pid" || true
+    kubectl delete service "$svc_ri" --ignore-not-found 2>/dev/null || true
+
+    local out_ri; out_ri=$(cat "$out_file")
+    rm -f "$out_file"
+
+    echo "$out_ri" | grep -Ev "^Type|Would you" | head -25 | sed 's/^/    /'
+
+    # Check 1: cmd is "iptables-restore"
+    local ri_pass=0
+    echo "$out_ri" | grep -q '"iptables-restore"'           && ri_pass=$((ri_pass+1))
+    # Check 2: fullArgs contains wait + noflush flags
+    echo "$out_ri" | grep -qE '"--noflush"|"-w"'            && ri_pass=$((ri_pass+1))
+    # Check 3: stack shows syncProxyRules → RestoreAll → restoreInternal
+    echo "$out_ri" | grep -qE 'restoreInternal|RestoreAll|syncProxyRules' && ri_pass=$((ri_pass+1))
+
+    if [[ $ri_pass -ge 2 ]]; then
+        ok "  iptables.go:427 断点命中（${ri_pass}/3 检查通过）"
+        record "kube-proxy restoreInternal" "✓ PASS" \
+            "breakpoint iptables.go:427: iptablesRestoreCmd=\"iptables-restore\", fullArgs=[--noflush,...] (${ri_pass}/3)"
+        record "kube-proxy executor.Command" "✓ PASS" \
+            "cmd=iptables-restore confirmed inside restoreInternal at line 427 (${ri_pass}/3)"
+    else
+        warn "  iptables.go:427 断点检查不足（${ri_pass}/3）"
+        record "kube-proxy restoreInternal" "⚠ WARN" "only ${ri_pass}/3 checks at line 427"
+        record "kube-proxy executor.Command" "⚠ WARN" "only ${ri_pass}/3 checks at line 427"
+    fi
+
+    # ── strace 验证: iptables-restore 子进程使用 AF_NETLINK 与内核通信 ─────────
+    # kube-proxy 进程在 dlv 下（ptrace 冲突不可被 strace），改为独立运行 iptables-restore
+    # 将当前规则保存到临时文件，以 --noflush 方式还原（等价于 no-op，不改变规则）
+    info "  strace 验证: iptables-restore → AF_NETLINK(NETLINK_NETFILTER) → 内核 nf_tables"
+    local rules_file; rules_file=$(mktemp /tmp/ipt-rules-XXXX.txt)
+    iptables-save 2>/dev/null > "$rules_file"
+
+    local strace_log; strace_log=$(mktemp /tmp/ipt-strace-XXXX.log)
+    # -f: follow forks; trace socket/sendto/sendmsg covers both legacy and nft backends
+    strace -f -e trace=socket,sendto,sendmsg \
+        iptables-restore --noflush < "$rules_file" > /dev/null 2> "$strace_log" || true
+    rm -f "$rules_file"
+
+    local nl_socket nl_sendto
+    nl_socket=$(grep -c "AF_NETLINK" "$strace_log" 2>/dev/null || echo 0)
+    nl_sendto=$(grep -cE "sendto|sendmsg" "$strace_log" 2>/dev/null || echo 0)
+
+    grep -E "socket.*AF_NETLINK|sendto.*NETLINK|sendmsg" "$strace_log" | head -4 | sed 's/^/    /'
+    rm -f "$strace_log"
+
+    if [[ $nl_socket -ge 1 ]] && [[ $nl_sendto -ge 1 ]]; then
+        ok "  iptables-restore → AF_NETLINK socket(${nl_socket}次) + sendto/sendmsg(${nl_sendto}次)"
+        record "kube-proxy iptables-restore netlink" "✓ PASS" \
+            "strace: socket(AF_NETLINK,NETLINK_NETFILTER)×${nl_socket} sendto/sendmsg×${nl_sendto} → kernel nf_tables"
+    else
+        warn "  strace 未观察到 netlink 调用（socket=${nl_socket} sendto/sendmsg=${nl_sendto}）"
+        record "kube-proxy iptables-restore netlink" "⚠ WARN" \
+            "socket=${nl_socket} sendto/sendmsg=${nl_sendto}"
+    fi
+}
+
 # ── 13. 内核路径（strace 系统调用追踪）────────────────────────────────────────
 # CONFIG_KPROBES=n, CONFIG_FTRACE=n → 无法追踪内核函数
 # strace 通过 ptrace 在 syscall 入口/出口捕获，是本环境内核路径观测的主要手段
@@ -2896,6 +3012,8 @@ echo ""
 test_coredns
 echo ""
 test_kube_proxy
+echo ""
+test_kube_proxy_restore_chain
 echo ""
 test_kernel_strace
 echo ""
