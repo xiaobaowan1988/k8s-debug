@@ -952,6 +952,94 @@ test_kube_proxy_restore_chain() {
         record "kube-proxy iptables-restore netlink" "⚠ WARN" \
             "socket=${nl_socket} sendto/sendmsg=${nl_sendto}"
     fi
+
+    # ── 有 endpoint 时的完整 nat 规则（KUBE-SVC + KUBE-SEP + DNAT）────────────
+    # kube-proxy 使用增量更新：endpoint 未变化时不重写 KUBE-SVC/KUBE-SEP 链（靠
+    # --noflush 保留）。必须触发 endpoint 变化才能在 data 中看到完整 DNAT 链。
+    # 策略：创建 pod（含 control-plane toleration）→ 等待 endpoint 就绪 →
+    #       重建 pod（触发 endpoint 变化）→ 捕获含 KUBE-SVC/KUBE-SEP 的 data
+    info "  测试有 endpoint 时的完整 nat 规则（KUBE-SVC → KUBE-SEP → DNAT）"
+    local ep_svc="ep-chain-${ts}"
+    local ep_pod="ep-chain-pod-${ts}"
+
+    # Create pod with control-plane toleration (single-node cluster)
+    kubectl run "$ep_pod" \
+        --image=registry.k8s.io/pause:3.10 \
+        --labels="app=${ep_svc}" \
+        --overrides='{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}' \
+        2>/dev/null || true
+    kubectl create service clusterip "$ep_svc" --tcp=7979:7979 2>/dev/null || true
+
+    # Wait for endpoint to be registered (up to 40s)
+    local ep_ready=0
+    for _ in $(seq 1 20); do
+        local ep_ip
+        ep_ip=$(kubectl get endpoints "$ep_svc" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+        if [[ -n "$ep_ip" ]]; then ep_ready=1; break; fi
+        sleep 2
+    done
+
+    if [[ $ep_ready -eq 0 ]]; then
+        warn "  ep-chain pod/endpoint 未就绪，跳过 KUBE-SVC/KUBE-SEP 验证"
+        record "kube-proxy data(has-endpoint)" "⚠ SKIP" "endpoint not ready within 40s"
+        kubectl delete pod "$ep_pod" --ignore-not-found 2>/dev/null || true
+        kubectl delete service "$ep_svc" --ignore-not-found 2>/dev/null || true
+        return
+    fi
+
+    # Recreate pod to trigger endpoint change → kube-proxy rewrites KUBE-SVC/KUBE-SEP
+    kubectl delete pod "$ep_pod" --ignore-not-found 2>/dev/null || true
+    sleep 1
+
+    # Keep dlv connected while pod comes back up and endpoint slice update fires
+    local out_ep
+    local out_file2; out_file2=$(mktemp /tmp/dlv-ep-XXXX.txt)
+    (echo "clearall"; sleep 0.3;
+     echo "b $bp_line"; sleep 0.4;
+     echo "c";
+     sleep 22;
+     echo "config max-string-len 3000"; sleep 0.3;
+     echo "p len(data)"; sleep 0.4;
+     echo "p string(data[800:2000])"; sleep 1.5;
+     echo "clearall"; sleep 0.3;
+     echo "c"; sleep 0.3) \
+    | timeout 55 dlv connect "localhost:$port" --allow-non-terminal-interactive=true \
+    > "$out_file2" 2>&1 &
+    local dlv_pid2=$!
+
+    # Recreate pod while dlv is connected
+    sleep 2
+    kubectl run "$ep_pod" \
+        --image=registry.k8s.io/pause:3.10 \
+        --labels="app=${ep_svc}" \
+        --overrides='{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}' \
+        2>/dev/null || true
+
+    wait "$dlv_pid2" || true
+    out_ep=$(cat "$out_file2")
+    rm -f "$out_file2"
+
+    kubectl delete pod "$ep_pod" --ignore-not-found 2>/dev/null || true
+    kubectl delete service "$ep_svc" --ignore-not-found 2>/dev/null || true
+
+    echo "$out_ep" | grep -oE '"[^"]*KUBE-S[EV][PC][^"]*"' | head -6 | sed 's/^/    /'
+
+    local ep_pass=0
+    # Check 1: nat table present in this sync
+    echo "$out_ep" | grep -q '\*nat'                                   && ep_pass=$((ep_pass+1))
+    # Check 2: KUBE-SVC chain with -j KUBE-SEP
+    echo "$out_ep" | grep -qE 'KUBE-SVC-[A-Z0-9]+.*KUBE-SEP'         && ep_pass=$((ep_pass+1))
+    # Check 3: KUBE-SEP chain with DNAT
+    echo "$out_ep" | grep -qE 'KUBE-SEP-[A-Z0-9]+.*DNAT'             && ep_pass=$((ep_pass+1))
+
+    if [[ $ep_pass -ge 2 ]]; then
+        ok "  有 endpoint 时 data 包含完整 nat 链（${ep_pass}/3）"
+        record "kube-proxy data(has-endpoint)" "✓ PASS" \
+            "nat: KUBE-SVC-xxx -j KUBE-SEP-xxx -j DNAT --to-destination pod-ip (${ep_pass}/3)"
+    else
+        warn "  有 endpoint 时 nat 链未在 data 中（${ep_pass}/3）"
+        record "kube-proxy data(has-endpoint)" "⚠ WARN" "only ${ep_pass}/3 nat chain checks"
+    fi
 }
 
 # ── 13. 内核路径（strace 系统调用追踪）────────────────────────────────────────
