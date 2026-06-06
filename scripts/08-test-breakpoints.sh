@@ -881,11 +881,11 @@ test_kube_proxy_restore_chain() {
      echo "p iptablesRestoreCmd"; sleep 0.5;
      echo "p fullArgs"; sleep 0.5;
      echo "p len(data)"; sleep 0.4;
+     echo "p string(data[:500])"; sleep 0.8;
      echo "stack 6"; sleep 0.5;
      echo "clearall"; sleep 0.3;
-     echo "c"; sleep 0.5;
-     echo "exit") \
-    | timeout 30 dlv connect "localhost:$port" --allow-non-terminal-interactive=true \
+     echo "c"; sleep 0.3) \
+    | timeout 40 dlv connect "localhost:$port" --allow-non-terminal-interactive=true \
     > "$out_file" 2>&1 &
     local dlv_pid=$!
 
@@ -905,11 +905,11 @@ test_kube_proxy_restore_chain() {
 
     # Check 1: cmd is "iptables-restore"
     local ri_pass=0
-    echo "$out_ri" | grep -q '"iptables-restore"'           && ri_pass=$((ri_pass+1))
+    echo "$out_ri" | grep -q '"iptables-restore"'                     && ri_pass=$((ri_pass+1))
     # Check 2: fullArgs contains wait + noflush flags
-    echo "$out_ri" | grep -qE '"--noflush"|"-w"'            && ri_pass=$((ri_pass+1))
-    # Check 3: stack shows syncProxyRules → RestoreAll → restoreInternal
-    echo "$out_ri" | grep -qE 'restoreInternal|RestoreAll|syncProxyRules' && ri_pass=$((ri_pass+1))
+    echo "$out_ri" | grep -qE '"--noflush"|"-w"'                      && ri_pass=$((ri_pass+1))
+    # Check 3: data contains actual iptables rules text (filter/nat table + KUBE chains)
+    echo "$out_ri" | grep -qE '\*filter|\*nat|KUBE-SERVICES|KUBE-FORWARD' && ri_pass=$((ri_pass+1))
 
     if [[ $ri_pass -ge 2 ]]; then
         ok "  iptables.go:427 断点命中（${ri_pass}/3 检查通过）"
